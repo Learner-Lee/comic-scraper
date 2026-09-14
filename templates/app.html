@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>漫画爬虫</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    max-width: 900px; margin-inline: auto;
+    background: Canvas; color: CanvasText;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { opacity: .6; font-size: 12px; margin-bottom: 24px; }
+  fieldset {
+    border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+    border-radius: 8px; padding: 16px; margin-bottom: 16px;
+  }
+  legend { padding: 0 8px; font-weight: 600; }
+  label { display: block; margin-bottom: 4px; font-size: 13px; opacity: .8; }
+  input[type=text] {
+    width: 100%; padding: 8px 10px; margin-bottom: 12px;
+    border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+    border-radius: 6px; background: Canvas; color: CanvasText; font: inherit;
+  }
+  button {
+    padding: 8px 16px; border-radius: 6px; font: inherit; cursor: pointer;
+    border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+    background: color-mix(in srgb, CanvasText 8%, Canvas); color: CanvasText;
+  }
+  button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .bar {
+    height: 8px; border-radius: 4px; margin: 12px 0 8px;
+    background: color-mix(in srgb, CanvasText 12%, transparent); overflow: hidden;
+  }
+  .bar > i { display: block; height: 100%; width: 0; background: #2563eb; transition: width .3s; }
+  pre {
+    background: color-mix(in srgb, CanvasText 6%, Canvas);
+    border-radius: 6px; padding: 12px; margin: 0;
+    height: 260px; overflow: auto; white-space: pre-wrap;
+    font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  }
+  #chapters { max-height: 200px; overflow: auto; margin-bottom: 12px; font-size: 13px; }
+  #chapters div { padding: 1px 0; }
+  .hint { font-size: 12px; opacity: .65; margin-top: 8px; }
+  .warn {
+    background: color-mix(in srgb, #f59e0b 15%, Canvas);
+    border-left: 3px solid #f59e0b; padding: 10px 12px;
+    border-radius: 4px; font-size: 13px; margin-top: 12px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td { padding: 3px 8px 3px 0; }
+  td.num { text-align: right; width: 70px; opacity: .7; font-variant-numeric: tabular-nums; }
+  td.tag { width: 46px; opacity: .55; font-size: 11px; }
+</style>
+</head>
+<body>
+
+<h1>漫画爬虫</h1>
+<div class="sub">输出目录：{{ out_root }}</div>
+
+<fieldset>
+  <legend>1 · 获取章节</legend>
+  <label for="url">漫画目录页 URL</label>
+  <input type="text" id="url" placeholder="https://manwame.com/book/xxxx-XXXXX">
+  <div class="row">
+    <button class="primary" id="btnFetch">获取章节</button>
+    <span id="fetchMsg" class="hint"></span>
+  </div>
+  <div id="chapters"></div>
+</fieldset>
+
+<fieldset>
+  <legend>2 · 下载</legend>
+  <label for="range">章节范围（留空 = 全部，示例 <code>1-10,15</code>）</label>
+  <input type="text" id="range" placeholder="留空下载全部">
+  <div class="row">
+    <button class="primary" id="btnDownload">开始下载</button>
+    <button id="btnCancel" disabled>取消</button>
+    <span id="dlState" class="hint"></span>
+  </div>
+  <div class="bar"><i id="barFill"></i></div>
+  <pre id="log">尚未开始。</pre>
+</fieldset>
+
+<fieldset>
+  <legend>3 · 人工检查</legend>
+  <div class="row">
+    <button id="btnCheck">刷新已下载章节</button>
+    <span id="checkMsg" class="hint"></span>
+  </div>
+  <table id="checkTable"></table>
+</fieldset>
+
+<fieldset>
+  <legend>4 · 打包 ZIP</legend>
+  <div class="warn">
+    每个章节各自打包成一个 zip，漫画目录本身仍是目录：<br>
+    <code>漫画名/001 第1话/*.webp</code> → <code>漫画名/001 第1话.zip</code><br>
+    每章 zip <b>校验通过后才删除</b>对应源目录，空间正是这样省下来的。请先确认第 3 步的图片数无误。
+  </div>
+  <div class="row" style="margin-top:12px">
+    <button class="primary" id="btnPack">按章节打包</button>
+    <label style="display:flex;align-items:center;gap:5px;margin:0;font-size:13px">
+      <input type="checkbox" id="keepSrc"> 保留源目录（不省空间）
+    </label>
+    <span id="packMsg" class="hint"></span>
+  </div>
+</fieldset>
+
+<script>
+const $ = id => document.getElementById(id);
+let comicName = "";
+let polling = null;
+
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data;
+}
+
+$("btnFetch").onclick = async () => {
+  const btn = $("btnFetch");
+  btn.disabled = true;
+  $("fetchMsg").textContent = "抓取中…";
+  $("chapters").innerHTML = "";
+  try {
+    const d = await post("/api/chapters", { url: $("url").value });
+    comicName = d.name;
+    $("fetchMsg").textContent = `《${d.name}》共 ${d.chapters.length} 章`;
+    $("chapters").innerHTML = d.chapters
+      .map(c => `<div>${String(c.index).padStart(3, " ")}　${escapeHtml(c.title)}</div>`)
+      .join("");
+  } catch (e) {
+    $("fetchMsg").textContent = "失败：" + e.message;
+  }
+  btn.disabled = false;
+};
+
+$("btnDownload").onclick = async () => {
+  try {
+    await post("/api/download", { url: $("url").value, chapters: $("range").value });
+    $("dlState").textContent = "";
+    startPolling();
+  } catch (e) {
+    $("dlState").textContent = "失败：" + e.message;
+  }
+};
+
+$("btnCancel").onclick = async () => {
+  await post("/api/cancel");
+  $("dlState").textContent = "正在取消，当前章节下完后停止…";
+};
+
+$("btnCheck").onclick = async () => {
+  if (!comicName) { $("checkMsg").textContent = "请先获取章节"; return; }
+  try {
+    const r = await fetch("/api/check?name=" + encodeURIComponent(comicName));
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+    $("checkMsg").textContent =
+      `${d.chapters.length} 章，共 ${d.total_images} 张图（未打包 ${d.unpacked} 章）`;
+    $("checkTable").innerHTML = d.chapters
+      .map(c => `<tr><td class="num">${c.images < 0 ? "损坏" : c.images + " 张"}</td>` +
+                `<td class="tag">${c.packed ? "zip" : "目录"}</td>` +
+                `<td>${escapeHtml(c.name)}</td></tr>`)
+      .join("");
+  } catch (e) {
+    $("checkMsg").textContent = "失败：" + e.message;
+  }
+};
+
+$("btnPack").onclick = async () => {
+  if (!comicName) { $("packMsg").textContent = "请先获取章节"; return; }
+  try {
+    await post("/api/pack", { name: comicName, keep: $("keepSrc").checked });
+    $("packMsg").textContent = "打包中…";
+    startPolling();
+  } catch (e) {
+    $("packMsg").textContent = "失败：" + e.message;
+  }
+};
+
+function startPolling() {
+  if (polling) clearInterval(polling);
+  polling = setInterval(tick, 800);
+  tick();
+}
+
+async function tick() {
+  const d = await (await fetch("/api/progress")).json();
+  const running = d.state === "running";
+  $("btnDownload").disabled = running;
+  $("btnPack").disabled = running;
+  $("btnCancel").disabled = !running || d.kind !== "download";
+
+  if (d.log.length) $("log").textContent = d.log.join("\n");
+  $("log").scrollTop = $("log").scrollHeight;
+
+  if (d.kind === "download" && d.total) {
+    $("barFill").style.width = (d.done / d.total * 100) + "%";
+    $("dlState").textContent = `${d.done}/${d.total} 章`;
+  }
+  if (d.zip_path) $("packMsg").textContent = "完成：" + d.zip_path;
+
+  if (!running) {
+    clearInterval(polling);
+    polling = null;
+    if (d.kind === "download" && d.state === "done") $("btnCheck").click();
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+</script>
+</body>
+</html>
