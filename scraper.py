@@ -31,7 +31,7 @@ from sites import Chapter, Comic, ScrapeError, Site, pick_site, safe_name
 __all__ = [
     "Chapter", "Comic", "ScrapeError", "Site", "pick_site", "safe_name",
     "make_session", "fetch_chapters", "fetch_chapter_images",
-    "download_chapter", "download_comic", "parse_chapter_spec",
+    "download_chapter", "download_comic", "probe", "parse_chapter_spec",
     "scan_downloaded", "pack_chapters",
 ]
 
@@ -160,6 +160,63 @@ def download_comic(book_url: str, out_root: str = "downloads",
 
     on_progress(f"完成，输出目录: {out_dir}")
     return out_dir
+
+
+def _reachable(session: requests.Session, url: str):
+    """只看响应头就够了，不下载正文。返回状态码，异常则返回异常名。"""
+    try:
+        resp = session.get(url, timeout=20, stream=True)
+        resp.close()
+        return resp.status_code
+    except Exception as exc:
+        return type(exc).__name__
+
+
+def probe(book_url: str, proxy: str | None = None, samples: int = 3,
+          on_progress: Callable[[str], None] = print) -> bool:
+    """下载前预检：解析布局、抽样生成图片地址并实际请求，确认这部能下。
+
+    存在的理由：8comic 的章节脚本是随机混淆的，字段布局每次重新生成都会变。
+    布局认错不会当场失败，只会生成一堆 404——那种错要下到一半才发现。
+    预检把它提前到几秒钟内，并把认出来的布局打出来，出问题时就是最直接的线索。
+    """
+    site = pick_site(book_url)
+    session = make_session(proxy, site)
+
+    comic = site.fetch_chapters(book_url, session)
+    on_progress(f"[{site.name}] 《{comic.name}》 {len(comic.chapters)} 章")
+    for line in site.diagnose(comic, session):
+        on_progress(f"  {line}")
+
+    n = len(comic.chapters)
+    picks = sorted({0, n // 2, n - 1})[:max(1, samples)]
+    on_progress("  抽查图片可达性：")
+
+    all_ok = True
+    for i in picks:
+        c = comic.chapters[i]
+        try:
+            urls = site.fetch_chapter_images(c.url, session)
+        except ScrapeError as exc:
+            on_progress(f"    ✗ {c.title} — {exc}")
+            all_ok = False
+            continue
+        if not urls:
+            on_progress(f"    ✗ {c.title} — 一张图都没解析到")
+            all_ok = False
+            continue
+
+        # 首末页各验一个：中间错位的话末页几乎必然也错
+        probe_urls = [urls[0]] if len(urls) == 1 else [urls[0], urls[-1]]
+        codes = [_reachable(session, u) for u in probe_urls]
+        good = all(x == 200 for x in codes)
+        all_ok = all_ok and good
+        on_progress(f"    {'✓' if good else '✗'} {c.title} — {len(urls)} 页，"
+                    f"首末页 HTTP {'/'.join(str(x) for x in codes)}")
+
+    on_progress("  ✓ 预检通过，可以下载" if all_ok else
+                "  ✗ 预检未通过，先别下——上面第一个 ✗ 就是原因")
+    return all_ok
 
 
 def parse_chapter_spec(spec: str | None) -> set[int] | None:
@@ -375,6 +432,11 @@ if __name__ == "__main__":
     p_dl.add_argument("-d", "--delay", type=float, default=0.15, help="每张图后的间隔秒数")
     p_dl.add_argument("--proxy", help="代理地址（默认直连）")
 
+    p_prb = sub.add_parser("probe", help="下载前预检：确认这部漫画现在能正常下")
+    p_prb.add_argument("url", help="漫画目录页 URL")
+    p_prb.add_argument("-n", "--samples", type=int, default=3, help="抽查几章")
+    p_prb.add_argument("--proxy", help="代理地址（默认直连）")
+
     p_chk = sub.add_parser("check", help="列出已下载的章节和图片数，供人工核对")
     p_chk.add_argument("dir", help="漫画目录，如 downloads/<漫画名>")
 
@@ -401,6 +463,9 @@ if __name__ == "__main__":
                                      args.workers, args.delay, args.proxy)
             print(f"\n请人工检查 {out_dir}，确认无误后运行：")
             print(f"  python scraper.py pack \"{out_dir}\"")
+
+        elif args.cmd == "probe":
+            raise SystemExit(0 if probe(args.url, args.proxy, args.samples) else 1)
 
         elif args.cmd == "check":
             rows = scan_downloaded(args.dir)

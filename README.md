@@ -29,6 +29,7 @@ pip install -r requirements.txt
 ## 命令行
 
 ```bash
+python scraper.py probe <URL>                     # 下载前预检（建议先跑）
 python scraper.py list <URL>                      # 列出章节
 python scraper.py download <URL>                  # 下载全部
 python scraper.py download https://www.8comic.com/html/12539.html -c 1-5
@@ -56,6 +57,36 @@ python scraper.py pack downloads/<漫画名>          # 确认后按章节打包
 | `--proxy` | 无 | 代理地址，默认直连 |
 
 **断点续传**：已存在的图片会跳过。下载中断或发现某章缺图，重跑同一条 `download` 命令即可只补缺失部分。
+
+## 开新漫画前先 probe
+
+```bash
+python scraper.py probe https://www.8comic.com/html/15059.html
+```
+
+```
+[8comic] 《入間同學入魔了》 454 章
+  记录布局 pages(0) code(2) ch(42) sd(44) part(46)，共 454 条  ✓ 自检通过
+  454 条记录全部健全（图床号、页数都合理）
+  抽查图片可达性：
+    ✓ 1話 — 44 页，首末页 HTTP 200/200
+    ✓ 228話 — 20 页，首末页 HTTP 200/200
+    ✓ 第455話 — 19 页，首末页 HTTP 200/200
+  ✓ 预检通过，可以下载
+```
+
+**为什么需要它**：8comic 的章节脚本是随机混淆的，字段布局每次重新生成都会变
+（站点更新一话就可能重排）。布局若认错不会当场失败，只会生成一堆 404——
+那种错要下到一半才发现。probe 把它提前到几秒内，顺便把认出来的布局打出来，
+出问题时这行就是最直接的线索。
+
+预检通过退出码 0，不通过 1，方便串起来用：
+
+```bash
+python scraper.py probe <URL> && python scraper.py download <URL>
+```
+
+`-n` 控制抽查几章（默认 3，取首、中、末）。manwame 同样适用，只是没有布局那几行。
 
 ## Web 界面
 

@@ -85,6 +85,10 @@ class Site:
                              session: requests.Session) -> list[str]:
         raise NotImplementedError
 
+    def diagnose(self, comic: Comic, session: requests.Session) -> list[str]:
+        """预检时要报告的站点特有信息。默认没有，子站按需覆盖。"""
+        return []
+
 
 # ------------------------------------------------------------------ manwame
 
@@ -416,6 +420,39 @@ class EightComicSite(Site):
         if not chapters:
             raise ScrapeError("目录里一章都没解析到，站点结构可能已改版")
         return Comic(name=name, url=book_url, chapters=chapters)
+
+    def diagnose(self, comic: Comic, session: requests.Session) -> list[str]:
+        """报告认出来的记录布局和数据健全性。
+
+        布局是随机混淆的、会变，所以预检时要把它摊开给人看——出问题时这行
+        信息就是最直接的线索。
+        """
+        m = re.search(r"/html/(\d+)", comic.url)
+        if not m:
+            return []
+        data, layout = self._load_data(m.group(1), session)
+
+        order = sorted(((k, v) for k, v in layout.items() if k != "count"),
+                       key=lambda kv: kv[1][0])
+        lines = ["记录布局 " + " ".join(f"{k}({v[0]})" for k, v in order)
+                 + f"，共 {layout['count']} 条  ✓ 自检通过"]
+
+        bad, have = [], set()
+        for i in range(layout["count"]):
+            rec = self._record(data, i, layout)
+            have.add(str(rec["ch"]))
+            if not (rec["sd"].isdigit() and len(rec["sd"]) >= 2
+                    and isinstance(rec["pages"], int) and 0 < rec["pages"] < 999):
+                bad.append(rec["ch"])
+        lines.append(f"{len(bad)} 条记录异常：{bad[:5]}" if bad
+                     else f"{layout['count']} 条记录全部健全（图床号、页数都合理）")
+
+        missing = [c.title for c in comic.chapters
+                   if c.url.rsplit("ch=", 1)[-1] not in have]
+        if missing:
+            lines.append(f"⚠ 目录里有 {len(missing)} 章站点数据中没有，会跳过："
+                         f"{'、'.join(missing[:4])}{'…' if len(missing) > 4 else ''}")
+        return lines
 
     def fetch_chapter_images(self, chapter_url: str,
                              session: requests.Session) -> list[str]:
