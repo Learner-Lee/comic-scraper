@@ -29,13 +29,19 @@ PROXY = os.environ.get("COMIC_PROXY") or None  # 默认直连
 
 
 class Job:
-    """当前任务的状态。所有字段读写都在 _lock 保护下。"""
+    """当前任务的状态。
+
+    除 _cancel（Event 自带线程安全）外，所有字段读写都在 _lock 保护下。
+    抢占任务槽一律走 try_begin，别在外面自己「先查后置」——那正是竞态的来源。
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._cancel = threading.Event()  # 一次性信号，自身线程安全，不归 _lock 管
         self.reset()
 
     def reset(self) -> None:
+        """清回空闲态。调用方负责持锁（try_begin 就是在锁内调的）。"""
         self.state = "idle"          # idle | running | done | error
         self.kind = ""               # download | pack
         self.log: deque[str] = deque(maxlen=600)
@@ -43,7 +49,27 @@ class Job:
         self.total = 0
         self.out_dir = ""
         self.zip_path = ""
-        self.cancel = False
+        self._cancel.clear()
+
+    def try_begin(self, kind: str) -> bool:
+        """原子地抢占任务槽：空闲才清状态并置 running，返回是否抢到。
+
+        「判空闲」和「置 running」必须在同一个临界区里完成。分成两步的话，
+        两个并发请求会双双通过检查，各起一个线程去踩同一份 JOB 状态。
+        """
+        with self._lock:
+            if self.state == "running":
+                return False
+            self.reset()
+            self.state = "running"
+            self.kind = kind
+            return True
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
 
     def say(self, msg: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
@@ -63,10 +89,6 @@ class Job:
                 "log": list(self.log),
             }
 
-    def busy(self) -> bool:
-        with self._lock:
-            return self.state == "running"
-
 
 JOB = Job()
 
@@ -82,7 +104,8 @@ def _safe_comic_dir(name: str) -> str:
 
 # ---------------------------------------------------------------- 后台任务
 
-def _run_download(url: str, picked: set[int] | None) -> None:
+def _run_download(url: str, picked: set[int] | None,
+                  workers: int, delay: float) -> None:
     try:
         session = scraper.make_session(PROXY)
         comic = scraper.fetch_chapters(url, session)
@@ -98,12 +121,12 @@ def _run_download(url: str, picked: set[int] | None) -> None:
         JOB.say(f"《{comic.name}》共 {len(comic.chapters)} 章，本次下载 {len(todo)} 章")
 
         for c in todo:
-            if JOB.cancel:
+            if JOB.cancelled():
                 JOB.say("已被用户取消")
                 break
             try:
                 ok, total = scraper.download_chapter(
-                    c, out_dir, session, DEFAULT_WORKERS, DEFAULT_DELAY)
+                    c, out_dir, session, workers, delay)
                 flag = "OK" if ok == total else "部分失败"
                 JOB.say(f"[{c.index}] {c.title} — {ok}/{total} {flag}")
             except scraper.ScrapeError as exc:
@@ -123,10 +146,10 @@ def _run_download(url: str, picked: set[int] | None) -> None:
             JOB.state = "error"
 
 
-def _run_pack(comic_dir: str, keep_source: bool) -> None:
+def _run_pack(comic_dir: str, keep_source: bool, ext: str) -> None:
     try:
         stat = scraper.pack_chapters(comic_dir, delete_source=not keep_source,
-                                     on_progress=JOB.say)
+                                     ext=ext, on_progress=JOB.say)
         with JOB._lock:
             JOB.zip_path = comic_dir
             JOB.state = "error" if stat["failed"] else "done"
@@ -136,19 +159,31 @@ def _run_pack(comic_dir: str, keep_source: bool) -> None:
             JOB.state = "error"
 
 
-def _start(kind: str, target, *args) -> None:
-    JOB.reset()
-    with JOB._lock:
-        JOB.state = "running"
-        JOB.kind = kind
+def _start(kind: str, target, *args) -> bool:
+    """抢到任务槽才起线程。抢不到返回 False，由调用方回 409。"""
+    if not JOB.try_begin(kind):
+        return False
     threading.Thread(target=target, args=args, daemon=True).start()
+    return True
+
+
+def _opt_num(data: dict, key: str, default, cast, lo, hi):
+    """取前端传来的可选数值：留空或填得不对都退回默认值，并夹进合理区间。"""
+    raw = str(data.get(key, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        return min(max(cast(raw), lo), hi)
+    except (TypeError, ValueError):
+        return default
 
 
 # ---------------------------------------------------------------- 路由
 
 @app.route("/")
 def index():
-    return render_template("app.html", out_root=DOWNLOAD_ROOT)
+    return render_template("app.html", out_root=DOWNLOAD_ROOT,
+                           def_workers=DEFAULT_WORKERS, def_delay=DEFAULT_DELAY)
 
 
 @app.post("/api/chapters")
@@ -170,17 +205,20 @@ def api_chapters():
 @app.post("/api/download")
 def api_download():
     """第二步：投递后台下载任务，立即返回。"""
-    if JOB.busy():
-        return jsonify({"error": "已有任务在跑，请等它结束或先取消"}), 409
     data = request.get_json(silent=True) or {}
     url = data.get("url", "").strip()
     if not url:
         return jsonify({"error": "请填写漫画目录页 URL"}), 400
     try:
         picked = scraper.parse_chapter_spec(data.get("chapters"))
-    except ValueError:
-        return jsonify({"error": "章节范围格式不对，示例：1-10,15"}), 400
-    _start("download", _run_download, url, picked)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    # 参数校验必须排在抢槽之前：校验失败不该把正在跑的任务状态清掉
+    workers = _opt_num(data, "workers", DEFAULT_WORKERS, int, 1, 16)
+    delay = _opt_num(data, "delay", DEFAULT_DELAY, float, 0.0, 5.0)
+    if not _start("download", _run_download, url, picked, workers, delay):
+        return jsonify({"error": "已有任务在跑，请等它结束或先取消"}), 409
     return jsonify({"ok": True})
 
 
@@ -191,7 +229,7 @@ def api_progress():
 
 @app.post("/api/cancel")
 def api_cancel():
-    JOB.cancel = True
+    JOB.cancel()
     return jsonify({"ok": True})
 
 
@@ -215,8 +253,6 @@ def api_check():
 @app.post("/api/pack")
 def api_pack():
     """第四步：人工确认后打包。源目录保留。"""
-    if JOB.busy():
-        return jsonify({"error": "已有任务在跑"}), 409
     data = request.get_json(silent=True) or {}
     try:
         comic_dir = _safe_comic_dir(data.get("name", ""))
@@ -224,7 +260,10 @@ def api_pack():
         return jsonify({"error": str(exc)}), 400
     if not os.path.isdir(comic_dir):
         return jsonify({"error": f"目录不存在: {comic_dir}"}), 404
-    _start("pack", _run_pack, comic_dir, bool(data.get("keep")))
+
+    ext = ".cbz" if data.get("cbz") else ".zip"
+    if not _start("pack", _run_pack, comic_dir, bool(data.get("keep")), ext):
+        return jsonify({"error": "已有任务在跑"}), 409
     return jsonify({"ok": True})
 
 

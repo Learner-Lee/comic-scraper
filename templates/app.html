@@ -48,6 +48,16 @@
   #chapters { max-height: 200px; overflow: auto; margin-bottom: 12px; font-size: 13px; }
   #chapters div { padding: 1px 0; }
   .hint { font-size: 12px; opacity: .65; margin-top: 8px; }
+  .opts { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+  .opts label {
+    display: flex; align-items: center; gap: 6px;
+    margin: 0; font-size: 13px; opacity: 1;
+  }
+  .opts input[type=text] { width: 88px; margin: 0; }
+  .inline {
+    display: flex; align-items: center; gap: 5px;
+    margin: 0; font-size: 13px;
+  }
   .warn {
     background: color-mix(in srgb, #f59e0b 15%, Canvas);
     border-left: 3px solid #f59e0b; padding: 10px 12px;
@@ -79,6 +89,11 @@
   <legend>2 · 下载</legend>
   <label for="range">章节范围（留空 = 全部，示例 <code>1-10,15</code>）</label>
   <input type="text" id="range" placeholder="留空下载全部">
+  <div class="opts">
+    <label>并发数 <input type="text" id="workers" placeholder="{{ def_workers }}"></label>
+    <label>间隔秒 <input type="text" id="delay" placeholder="{{ def_delay }}"></label>
+    <span class="hint" style="margin:0">留空用默认值</span>
+  </div>
   <div class="row">
     <button class="primary" id="btnDownload">开始下载</button>
     <button id="btnCancel" disabled>取消</button>
@@ -106,8 +121,11 @@
   </div>
   <div class="row" style="margin-top:12px">
     <button class="primary" id="btnPack">按章节打包</button>
-    <label style="display:flex;align-items:center;gap:5px;margin:0;font-size:13px">
+    <label class="inline">
       <input type="checkbox" id="keepSrc"> 保留源目录（不省空间）
+    </label>
+    <label class="inline">
+      <input type="checkbox" id="useCbz"> 用 .cbz 扩展名（Tachiyomi / Komga 识别）
     </label>
     <span id="packMsg" class="hint"></span>
   </div>
@@ -149,7 +167,12 @@ $("btnFetch").onclick = async () => {
 
 $("btnDownload").onclick = async () => {
   try {
-    await post("/api/download", { url: $("url").value, chapters: $("range").value });
+    await post("/api/download", {
+      url: $("url").value,
+      chapters: $("range").value,
+      workers: $("workers").value,
+      delay: $("delay").value,
+    });
     $("dlState").textContent = "";
     startPolling();
   } catch (e) {
@@ -183,7 +206,11 @@ $("btnCheck").onclick = async () => {
 $("btnPack").onclick = async () => {
   if (!comicName) { $("packMsg").textContent = "请先获取章节"; return; }
   try {
-    await post("/api/pack", { name: comicName, keep: $("keepSrc").checked });
+    await post("/api/pack", {
+      name: comicName,
+      keep: $("keepSrc").checked,
+      cbz: $("useCbz").checked,
+    });
     $("packMsg").textContent = "打包中…";
     startPolling();
   } catch (e) {

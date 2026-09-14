@@ -234,19 +234,38 @@ def download_comic(book_url: str, out_root: str = "downloads",
 
 
 def parse_chapter_spec(spec: str | None) -> set[int] | None:
-    """把 '1-10,15,20-22' 解析成序号集合。None / 空 表示全选。"""
+    """把 '1-10,15,20-22' 解析成序号集合。None / 空 表示全选。
+
+    解析不了就抛带说明的 ValueError——别让 int() 的裸异常一路冒到命令行去，
+    用户看到的应该是「哪里填错了」，不是一屏堆栈。
+    """
     if not spec or not spec.strip():
         return None
+
+    def _num(text: str) -> int:
+        text = text.strip()
+        if not text:
+            raise ValueError(f"『{spec.strip()}』里有个数字漏了。格式示例：1-10,15")
+        try:
+            n = int(text)
+        except ValueError:
+            raise ValueError(f"『{text}』不是数字。格式示例：1-10,15") from None
+        if n < 1:
+            raise ValueError(f"章节序号从 1 开始，不能是 {n}")
+        return n
+
     picked: set[int] = set()
     for part in spec.split(","):
         part = part.strip()
         if not part:
             continue
         if "-" in part:
-            a, b = part.split("-", 1)
-            picked.update(range(int(a), int(b) + 1))
+            a, b = (_num(x) for x in part.split("-", 1))
+            if a > b:
+                raise ValueError(f"区间头尾反了：{part}")
+            picked.update(range(a, b + 1))
         else:
-            picked.add(int(part))
+            picked.add(_num(part))
     return picked or None
 
 
@@ -473,5 +492,7 @@ if __name__ == "__main__":
 
     except ScrapeError as exc:
         raise SystemExit(f"错误: {exc}")
+    except ValueError as exc:
+        raise SystemExit(f"参数错误: {exc}")
     except KeyboardInterrupt:
         raise SystemExit("\n已中断。已完成的部分保留，重跑同一命令可继续。")
