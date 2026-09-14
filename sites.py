@@ -197,7 +197,9 @@ class EightComicSite(Site):
     _SD_RE = re.compile(r"\w+\(\s*(\w+)\s*,\s*0\s*,\s*1\s*\)")
     _CODE_RE = re.compile(r"\w+\(\s*(\w+)\s*,\s*mm\(j\)\s*,\s*3\s*\)")
     _PART_RE = re.compile(r'\(\s*(\w+)\s*==\s*"0"\s*\?')
-    _PAGES_RE = re.compile(r"\bps\s*=\s*(\w+)\s*;")
+    # 只认变量名开头，挡掉循环外的 `var ps=0;` 初始化
+    _PAGES_RE = re.compile(r"\bps\s*=\s*([A-Za-z_$][\w$]*)\s*[;,]")
+    _CH_RE = re.compile(r"if\s*\(\s*(\w+)\s*==\s*ch\b")
     _SUDEF_RE = re.compile(
         r"function\s+\w+\([^)]*\)\s*\{\s*if\s*\(\s*\w+\s*==\s*null\s*\)\s*\w+\s*=\s*(\d+)")
     _LOOP_RE = re.compile(r"for\s*\(\s*var\s+i\s*=\s*0\s*;\s*i\s*<\s*(\d+)\s*;")
@@ -255,35 +257,60 @@ class EightComicSite(Site):
     def _parse_layout(self, html: str) -> dict:
         """从页面内联脚本读出这部漫画的记录布局。
 
-        按语义认字段（URL 里谁被当图床号用、谁被当 code 用），而不是按固定
-        位置猜——位置是随漫画变的。认不出就报错，绝不用猜的布局硬算：
-        那只会生成一堆 404，比直接失败更难排查。
+        **五个字段的位置全是随漫画变的**，实测三部漫画就有三种排列：
+
+            《唐三葬》    ch(0)    pages(2)  code(4)   sd(44)  part(46)
+            《平行天堂》  ch(0)    pages(2)  sd(4)     code(6) part(46)
+            《入間同學》  pages(0) code(2)   ch(42)    sd(44)  part(46)
+
+        所以一个位置都不能假设，全部按「脚本里怎么用它」来认：
+
+            谁拿去和 ch 比较        -> 章节号
+            谁被赋给 ps            -> 页数
+            谁被当图床号取头两位     -> sd
+            谁按 mm(j) 取 3 字符    -> code
+            谁拿去和 "0" 比较       -> part
+
+        认不出就报错，绝不拿猜的布局硬算——那只会生成一堆 404，
+        而 404 是最难排查的一种失败。
         """
         m = self._SUDEF_RE.search(html)
         su_default = int(m.group(1)) if m else 40
         fields = {name: (int(off), int(ln) if ln else su_default)
                   for name, off, ln in self._FIELD_RE.findall(html)}
-
-        sd_m, code_m = self._SD_RE.search(html), self._CODE_RE.search(html)
-        part_m, loop_m = self._PART_RE.search(html), self._LOOP_RE.search(html)
-        if not (fields and sd_m and code_m and part_m and loop_m):
+        loop_m = self._LOOP_RE.search(html)
+        if not fields or not loop_m:
             raise ScrapeError("认不出章节记录的布局，站点脚本可能已改版")
 
-        missing = [v.group(1) for v in (sd_m, code_m, part_m)
-                   if v.group(1) not in fields]
-        if missing:
-            raise ScrapeError(f"字段 {missing} 不在记录里，站点脚本可能已改版")
+        def pick(rx, label):
+            # 同一个模式可能命中多处（如循环外的初始化），取第一个真是记录字段的
+            for name in rx.findall(html):
+                if name in fields:
+                    return fields[name]
+            raise ScrapeError(f"记录里认不出「{label}」字段，站点脚本可能已改版")
 
-        pages_m = self._PAGES_RE.search(html)
-        by_off = {off: (off, ln) for off, ln in fields.values()}
-        pages = (fields.get(pages_m.group(1)) if pages_m else None) or by_off.get(2)
-        ch = by_off.get(0)
-        if ch is None or pages is None:
-            raise ScrapeError("记录里找不到章节号或页数字段，站点脚本可能已改版")
+        layout = {
+            "count": int(loop_m.group(1)),
+            "ch": pick(self._CH_RE, "章节号"),
+            "pages": pick(self._PAGES_RE, "页数"),
+            "code": pick(self._CODE_RE, "code"),
+            "sd": pick(self._SD_RE, "图床号"),
+            "part": pick(self._PART_RE, "part"),
+        }
 
-        return {"count": int(loop_m.group(1)), "ch": ch, "pages": pages,
-                "code": fields[code_m.group(1)], "sd": fields[sd_m.group(1)],
-                "part": fields[part_m.group(1)]}
+        # 认错布局不会当场失败，只会悄悄生成错 URL，所以这里就把关
+        spans = {k: layout[k] for k in ("ch", "pages", "code", "sd", "part")}
+        for k, (off, ln) in spans.items():
+            if off < 0 or ln < 1 or off + ln > self._REC:
+                raise ScrapeError(
+                    f"字段「{k}」范围 {off}..{off + ln} 超出 {self._REC} 字符的记录，"
+                    "站点脚本可能已改版")
+        ordered = sorted(spans.items(), key=lambda kv: kv[1][0])
+        for (k1, (o1, l1)), (k2, (o2, _)) in zip(ordered, ordered[1:]):
+            if o1 + l1 > o2:
+                raise ScrapeError(
+                    f"字段「{k1}」和「{k2}」在记录里重叠，站点脚本可能已改版")
+        return layout
 
     def _load_data(self, cid: str, session: requests.Session) -> tuple[str, dict]:
         """取回并缓存某部漫画的数据串与布局，返回 (数据串, 布局)。"""
@@ -310,6 +337,17 @@ class EightComicSite(Site):
             raise ScrapeError(
                 f"数据串长度 {len(data)} 放不下 {layout['count']} 条记录，"
                 "站点算法可能已改")
+
+        # 布局就算通过了结构自检，也可能整体认错。拿第一条记录验一下真实性：
+        # 图床号必须是数字、页数必须是合理正整数，否则拼出来的全是 404。
+        first = self._record(data, 0, layout)
+        if not (first["sd"].isdigit() and len(first["sd"]) >= 2):
+            raise ScrapeError(
+                f"图床号解出来是 {first['sd']!r}（应是两位以上数字），"
+                "布局认错了，站点脚本可能已改版")
+        if not isinstance(first["pages"], int) or not 1 <= first["pages"] <= 999:
+            raise ScrapeError(
+                f"页数解出来是 {first['pages']!r}，布局认错了，站点脚本可能已改版")
 
         self._cache[cid] = (data, layout)
         return data, layout
