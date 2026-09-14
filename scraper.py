@@ -1,89 +1,59 @@
-"""manwame.com 漫画抓取核心模块。
+"""漫画抓取核心模块：通用流程。
 
-两段式流程：
-    1. fetch_chapters(book_url)      -> 目录页解析出章节列表
-    2. fetch_chapter_images(ch_url)  -> 章节页解密出图片直链
-    3. download_comic(...)           -> 按章节并发下载，支持断点续传
+    1. pick_site(url)                -> 按 URL 选出站点适配器
+    2. site.fetch_chapters(...)      -> 目录页解析出章节列表
+    3. site.fetch_chapter_images(..) -> 章节页解出图片直链
+    4. download_comic(...)           -> 按章节并发下载，支持断点续传
 
-无需 Selenium，无需代理。依赖：requests, beautifulsoup4, pycryptodome
+站点相关的解析都在 sites.py，本文件只管与站点无关的事：下载、断点续传、
+原子落盘、打包、校验、人工检查。加新站点不用动这里。
+
+无需 Selenium。依赖：requests, beautifulsoup4, pycryptodome
 """
 from __future__ import annotations
 
-import base64
-import json
 import os
-import re
 import shutil
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
-from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-SITE = "https://manwame.com"
+import sites
+# 重新导出，让外部（app.py 等）继续用 scraper.X
+from sites import Chapter, Comic, ScrapeError, Site, pick_site, safe_name
 
-# 站点前端 cms.js 里硬编码的 AES-128 密钥。若某天全站解密失败，多半是这里变了：
-# 在章节页源码找 params，用浏览器控制台跑 CMS.chapter.decrypt(params) 对照即可。
-_AES_KEY = b"5V&RoR%Jf@pJPydF"
-
-_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
-
-_PARAMS_RE = re.compile(r"params\s*=\s*'([A-Za-z0-9+/=]+)'")
-_ABSOLUTE_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*:|//)", re.I)
-# Windows 文件名非法字符 + 控制字符
-_ILLEGAL_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+__all__ = [
+    "Chapter", "Comic", "ScrapeError", "Site", "pick_site", "safe_name",
+    "make_session", "fetch_chapters", "fetch_chapter_images",
+    "download_chapter", "download_comic", "parse_chapter_spec",
+    "scan_downloaded", "pack_chapters",
+]
 
 _EXT_BY_TYPE = {
     "image/webp": ".webp",
     "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
     "image/png": ".png",
     "image/gif": ".gif",
     "image/avif": ".avif",
 }
 
 
-class ScrapeError(RuntimeError):
-    """抓取过程中的可预期错误。"""
+def make_session(proxy: str | None = None,
+                 site: sites.Site | None = None) -> requests.Session:
+    """带自动重试的 Session。proxy 传 None 即直连（默认就够用）。
 
-
-@dataclass
-class Chapter:
-    url: str
-    title: str
-    index: int  # 在目录中的序号，从 1 开始
-
-
-@dataclass
-class Comic:
-    name: str
-    url: str
-    chapters: list[Chapter] = field(default_factory=list)
-
-
-def safe_name(name: str, fallback: str = "untitled") -> str:
-    """把章节名/漫画名转成各平台都能用的目录名。"""
-    cleaned = _ILLEGAL_RE.sub("", name).strip().strip(".")
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned[:120] or fallback
-
-
-def make_session(proxy: str | None = None) -> requests.Session:
-    """带自动重试的 Session。proxy 传 None 即直连（默认就够用）。"""
+    site 决定额外的请求头——各站要求不同：manwame 的图片 CDN 强制校验
+    Referer，8comic 的章节页不带 Referer 会返回伪装页。
+    """
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": _UA,
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Referer": SITE + "/",  # CDN 强制校验，缺了会 403
-    })
+    s.headers.update(sites.default_headers(site))
     retry = Retry(
         total=3,
         backoff_factor=0.5,
@@ -99,65 +69,21 @@ def make_session(proxy: str | None = None) -> requests.Session:
     return s
 
 
-def decrypt_params(blob: str) -> dict:
-    """解开章节页 params：AES-128-CBC，IV 是密文前 16 字节。"""
-    try:
-        raw = base64.b64decode(blob)
-        plain = unpad(
-            AES.new(_AES_KEY, AES.MODE_CBC, raw[:16]).decrypt(raw[16:]),
-            AES.block_size,
-        )
-        return json.loads(plain.decode("utf-8"))
-    except Exception as exc:
-        raise ScrapeError(f"params 解密失败（站点密钥可能已更换）: {exc}") from exc
+def fetch_chapters(book_url: str, session: requests.Session,
+                   site: sites.Site | None = None) -> Comic:
+    """第一步：从目录页取出全部章节。site 省略时按 URL 自动识别。"""
+    return (site or pick_site(book_url)).fetch_chapters(book_url, session)
 
 
-def fetch_chapters(book_url: str, session: requests.Session) -> Comic:
-    """第一步：从目录页取出全部章节 URL 和名称。"""
-    resp = session.get(book_url, timeout=20)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+def fetch_chapter_images(chapter_url: str, session: requests.Session,
+                         site: sites.Site | None = None) -> list[str]:
+    """第二步：解析章节页，拿到图片直链。
 
-    title_el = soup.select_one(".profile-text h1")
-    name = safe_name(title_el.get_text(strip=True) if title_el else "", "comic")
-
-    box = soup.select_one("[data-chapter-list]")
-    if box is None:
-        raise ScrapeError("目录页没找到 [data-chapter-list]，站点结构可能已改版")
-
-    chapters = [
-        Chapter(url=urljoin(SITE, a["href"]),
-                title=safe_name(a.get_text(strip=True), f"chapter_{i}"),
-                index=i)
-        for i, a in enumerate(box.select("a[href]"), start=1)
-    ]
-    if not chapters:
-        raise ScrapeError("目录里一章都没解析到")
-    return Comic(name=name, url=book_url, chapters=chapters)
-
-
-def fetch_chapter_images(chapter_url: str, session: requests.Session) -> list[str]:
-    """第二步：解密章节页，拼出图片直链。"""
-    resp = session.get(chapter_url, timeout=20)
-    resp.raise_for_status()
-
-    m = _PARAMS_RE.search(resp.text)
-    if not m:
-        raise ScrapeError(f"章节页没有 params: {chapter_url}")
-    params = decrypt_params(m.group(1))
-
-    if params.get("comic_status") == "down":
-        raise ScrapeError("该漫画已下架")
-
-    host = (params.get("images_domain")
-            or next(iter(params.get("images_hosts") or []), "")
-            or params.get("cdnurl") or "")
-
-    urls = []
-    for item in params.get("chapter_images") or []:
-        urls.append(item if _ABSOLUTE_RE.match(item)
-                    else f"{host.rstrip('/')}/{str(item).lstrip('/')}")
-    return urls
+    注意：8comic 的适配器会缓存整部漫画的数据，所以整部下载时应复用同一个
+    site 实例，别每章新建一个——那样会白白多请求 N 次。
+    """
+    return (site or pick_site(chapter_url)).fetch_chapter_images(
+        chapter_url, session)
 
 
 def _download_one(url: str, dest_dir: str, idx: int,
@@ -187,9 +113,10 @@ def _download_one(url: str, dest_dir: str, idx: int,
 
 
 def download_chapter(chapter: Chapter, out_dir: str, session: requests.Session,
-                     workers: int = 4, delay: float = 0.15) -> tuple[int, int]:
+                     workers: int = 4, delay: float = 0.15,
+                     site: sites.Site | None = None) -> tuple[int, int]:
     """下载一章，返回 (成功数, 总数)。"""
-    urls = fetch_chapter_images(chapter.url, session)
+    urls = fetch_chapter_images(chapter.url, session, site)
     dest = os.path.join(out_dir, f"{chapter.index:03d} {chapter.title}")
     os.makedirs(dest, exist_ok=True)
 
@@ -212,18 +139,20 @@ def download_comic(book_url: str, out_root: str = "downloads",
 
     on_progress 是进度回调，接 WebUI 时换成往队列里塞消息即可。
     """
-    session = make_session(proxy)
-    comic = fetch_chapters(book_url, session)
+    site = pick_site(book_url)
+    session = make_session(proxy, site)
+    comic = site.fetch_chapters(book_url, session)
     out_dir = os.path.join(out_root, comic.name)
     os.makedirs(out_dir, exist_ok=True)
 
     todo = [c for c in comic.chapters
             if chapters is None or c.index in set(chapters)]
-    on_progress(f"《{comic.name}》共 {len(comic.chapters)} 章，本次下载 {len(todo)} 章")
+    on_progress(f"[{site.name}] 《{comic.name}》共 {len(comic.chapters)} 章，"
+                f"本次下载 {len(todo)} 章")
 
     for c in todo:
         try:
-            ok, total = download_chapter(c, out_dir, session, workers, delay)
+            ok, total = download_chapter(c, out_dir, session, workers, delay, site)
             flag = "OK" if ok == total else "部分失败"
             on_progress(f"[{c.index}/{len(comic.chapters)}] {c.title} — {ok}/{total} {flag}")
         except ScrapeError as exc:
@@ -460,8 +389,9 @@ if __name__ == "__main__":
 
     try:
         if args.cmd == "list":
-            comic = fetch_chapters(args.url, make_session(args.proxy))
-            print(f"《{comic.name}》 {len(comic.chapters)} 章")
+            site = pick_site(args.url)
+            comic = site.fetch_chapters(args.url, make_session(args.proxy, site))
+            print(f"[{site.name}] 《{comic.name}》 {len(comic.chapters)} 章")
             for c in comic.chapters:
                 print(f"  {c.index:3d}  {c.title}")
 

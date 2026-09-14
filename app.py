@@ -107,8 +107,9 @@ def _safe_comic_dir(name: str) -> str:
 def _run_download(url: str, picked: set[int] | None,
                   workers: int, delay: float) -> None:
     try:
-        session = scraper.make_session(PROXY)
-        comic = scraper.fetch_chapters(url, session)
+        site = scraper.pick_site(url)
+        session = scraper.make_session(PROXY, site)
+        comic = site.fetch_chapters(url, session)
         todo = [c for c in comic.chapters
                 if picked is None or c.index in picked]
 
@@ -118,7 +119,8 @@ def _run_download(url: str, picked: set[int] | None,
         with JOB._lock:
             JOB.total = len(todo)
             JOB.out_dir = out_dir
-        JOB.say(f"《{comic.name}》共 {len(comic.chapters)} 章，本次下载 {len(todo)} 章")
+        JOB.say(f"[{site.name}] 《{comic.name}》共 {len(comic.chapters)} 章，"
+                f"本次下载 {len(todo)} 章")
 
         for c in todo:
             if JOB.cancelled():
@@ -126,7 +128,7 @@ def _run_download(url: str, picked: set[int] | None,
                 break
             try:
                 ok, total = scraper.download_chapter(
-                    c, out_dir, session, workers, delay)
+                    c, out_dir, session, workers, delay, site)
                 flag = "OK" if ok == total else "部分失败"
                 JOB.say(f"[{c.index}] {c.title} — {ok}/{total} {flag}")
             except scraper.ScrapeError as exc:
@@ -192,8 +194,13 @@ def api_chapters():
     url = (request.get_json(silent=True) or {}).get("url", "").strip()
     if not url:
         return jsonify({"error": "请填写漫画目录页 URL"}), 400
+    # 贴错站点是用户输入问题，回 400；抓取本身失败才是上游问题，回 502
     try:
-        comic = scraper.fetch_chapters(url, scraper.make_session(PROXY))
+        site = scraper.pick_site(url)
+    except scraper.ScrapeError as exc:
+        return jsonify({"error": str(exc)}), 400
+    try:
+        comic = site.fetch_chapters(url, scraper.make_session(PROXY, site))
     except Exception as exc:
         return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 502
     return jsonify({

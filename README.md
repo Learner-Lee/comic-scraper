@@ -1,6 +1,11 @@
 # 漫画爬虫
 
-抓取 manwame.com 的漫画，支持命令行和 Web 界面两种用法。
+抓取漫画，支持命令行和 Web 界面两种用法。贴哪个站的 URL 会自动识别，用法完全一样。
+
+| 站点 | 目录页 URL 形态 |
+|---|---|
+| manwame.com | `https://manwame.com/book/<名字>-<id>` |
+| 8comic.com（無限動漫） | `https://www.8comic.com/html/<id>.html` |
 
 **流程：** 获取章节 → 下载到文件夹 → **人工检查** → 按章节打包 ZIP
 
@@ -26,6 +31,7 @@ pip install -r requirements.txt
 ```bash
 python scraper.py list <URL>                      # 列出章节
 python scraper.py download <URL>                  # 下载全部
+python scraper.py download https://www.8comic.com/html/12539.html -c 1-5
 python scraper.py download <URL> -c 1-10,15       # 只下指定章节
 python scraper.py check downloads/<漫画名>         # 核对每章图片数
 python scraper.py pack downloads/<漫画名>          # 确认后按章节打包
@@ -71,15 +77,30 @@ python app.py                   # http://127.0.0.1:60001
 
 | 文件 | 作用 |
 |---|---|
-| `scraper.py` | 核心库 + 命令行入口 |
+| `scraper.py` | 通用流程（下载、断点续传、打包、校验）+ 命令行入口 |
+| `sites.py` | 站点适配器：各站怎么拿章节列表、怎么拿图片直链 |
 | `app.py` | Flask Web 界面 |
 | `templates/app.html` | 前端单页 |
 
+加新站点只需在 `sites.py` 写一个 `Site` 子类并挂进 `_SITES`，别处一行都不用改。
+
 ## 工作原理
+
+两个站点的差异**只有两处**：怎么拿章节列表、怎么拿图片直链。下载、断点续传、打包、校验全部与站点无关。
+
+### manwame.com
 
 1. **章节目录**是服务端直出的 HTML，用 `[data-chapter-list] a` 选择器即可解析，不需要浏览器内核。
 2. **章节图片**不在 HTML 里，而是 AES-128-CBC 加密后放在页面的 `params` 变量中。IV 是 base64 解码后的前 16 字节，密文是其余部分，解密得到含 `chapter_images`（图片 token）和 `images_hosts`（CDN 域名）的 JSON。
 3. **图片 CDN 强制校验 Referer**，不带会返回 403（页面 HTML 里的 `referrerpolicy="no-referrer"` 是误导）。
+
+### 8comic.com
+
+1. **章节目录**也是直出 HTML，取 `a.Ch` 的 `onclick`。注意页面里有两个 `ul.eps_list`，第一个是空壳，真正的章节在第二个。
+2. **章节页必须带 Referer**。不带的话服务器返回一个毫无数据的伪装页，而且**状态码仍是 200**。这种「假装成功」最容易让爬虫静默跑空，所以解析不到数据串时程序会明确报错，绝不当成空章节跳过。
+3. **图片直链不加密**，而是把参数塞进一个长字符串：每章一条定长 47 字符的记录（章节号、页数、code、图床号、part），域名被拆成十六进制片段藏在串尾。算法取自站点 `j.js` 的 `lc` / `su` / `nn` / `mm`。
+4. **整部漫画只需请求一次章节页**。同一部漫画任意章节页的数据串完全相同且含全部章节，所以 47 章只要 1 次请求（manwame 是每章 1 次）。适配器内按漫画 id 缓存。
+5. 图片 CDN 不校验 Referer，图片格式是 jpg。
 
 ## 关于「省空间」
 
@@ -91,8 +112,20 @@ python app.py                   # http://127.0.0.1:60001
 
 ## 维护提示
 
-AES 密钥是从站点前端 `cms.js` 提取的硬编码值，写在 `scraper.py` 顶部。站点若更换密钥，所有章节会同时解密失败，程序会明确报错提示。
+两个站点的硬编码值都集中在 `sites.py` 各自的类里，站点改版时只改那里。所有失败路径都有明确报错，不会静默跑空。
+
+### manwame
+
+AES 密钥是从站点前端 `cms.js` 提取的硬编码值。站点若更换密钥，所有章节会同时解密失败，程序会明确报错提示。
 
 重新提取方法：打开任意章节页，在浏览器控制台执行 `CMS.chapter.decrypt(params)` 对照，或用 Node 加载 `cms.js` 后钩住 `CryptoJS.AES.decrypt` 打印密钥。
 
 站点若改版导致目录解析失败，程序会报 `目录页没找到 [data-chapter-list]`，届时更新选择器即可。
+
+### 8comic
+
+解码常量（记录长度 47、各字段偏移、尾部片段区算式）写在 `EightComicSite` 的类属性里。
+
+**数据串的变量名是站点每次构建随机生成的**（实测为 `wfp6_em7u4`），所以解析器不依赖变量名，而是按「页面里最长的那个字母数字串」来认——站点换了变量名也不受影响。
+
+重新核对算法：抓一个章节页，把 `j.js` 的 `lc`/`su`/`nn`/`mm` 和页面内联脚本的拼接逻辑用 Node 跑一遍，与本工具生成的 URL 逐条比对即可。
