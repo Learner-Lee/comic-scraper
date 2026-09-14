@@ -182,28 +182,37 @@ class EightComicSite(Site):
     # 章节页地址取自站点 comicview.js 的 cview()：非 VIP 会被送到这个域名
     _VIEW = "https://articles.onemoreplace.tw/online/new-{cid}.html?ch={ch}"
 
-    # ---- 以下常量全部取自站点 j.js 与章节页内联脚本。站点改版就改这里 ----
+    # ---- 以下常量取自站点 j.js 与章节页内联脚本。站点改版就改这里 ----
     _REC = 47              # 每章一条记录的字符数
-    _F_CH = (0, 2)         # 章节号（_lc 解码）
-    _F_PAGES = (2, 2)      # 该章页数（_lc 解码）
-    _F_CODE = (4, 40)      # 拼文件名用的 code
-    _F_SD = (44, 2)        # 图床号 + 目录号（_lc 解码成两位数字）
-    _F_PART = (46, 1)      # part 后缀，"0" 表示没有
     _FRAG_BASE = 47        # 尾部片段区：frag(n) 取 data[len-47-n*6 : +6]
     _FRAG_LEN = 6
+
+    # 字段偏移**不能写死**：同一个站点，不同漫画的页面布局是不一样的。
+    # 实测《唐三葬》code 在 4、sd 在 44，而《平行天堂》sd 在 4、code 在 6。
+    # 写死任何一种，另一种就会整体错位（sd 会解出负数，URL 全是 404）。
+    # 所以每次都从页面的内联脚本里现读，按语义认字段而不是按位置猜。
+    _FIELD_RE = re.compile(
+        r"var\s+(\w+)\s*=\s*\w+\(\s*\w+\(\s*\w+\s*,\s*i\s*\*\s*\([^)]+\)"
+        r"\s*\+\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)\s*\)")
+    _SD_RE = re.compile(r"\w+\(\s*(\w+)\s*,\s*0\s*,\s*1\s*\)")
+    _CODE_RE = re.compile(r"\w+\(\s*(\w+)\s*,\s*mm\(j\)\s*,\s*3\s*\)")
+    _PART_RE = re.compile(r'\(\s*(\w+)\s*==\s*"0"\s*\?')
+    _PAGES_RE = re.compile(r"\bps\s*=\s*(\w+)\s*;")
+    _SUDEF_RE = re.compile(
+        r"function\s+\w+\([^)]*\)\s*\{\s*if\s*\(\s*\w+\s*==\s*null\s*\)\s*\w+\s*=\s*(\d+)")
+    _LOOP_RE = re.compile(r"for\s*\(\s*var\s+i\s*=\s*0\s*;\s*i\s*<\s*(\d+)\s*;")
 
     _AZ = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
     # 数据串的变量名是站点构建时随机生成的（实测 wfp6_em7u4），不能依赖它，
     # 只能按「页面里最长的那个字母数字串」来认。
     _DATA_RE = re.compile(r"var\s+[A-Za-z_$][\w$]*\s*=\s*'([A-Za-z0-9]{200,})'")
-    _CHS_RE = re.compile(r"var\s+chs\s*=\s*(\d+)")
     _CVIEW_RE = re.compile(r"cview\(\s*'(\d+)-([0-9a-zA-Z]+)\.html'")
 
     def __init__(self) -> None:
         # 同一部漫画的任意章节页，数据串完全相同且含全部章节，
         # 所以整部只需请求一次。缓存 key 是漫画 id。
-        self._cache: dict[str, tuple[str, int]] = {}
+        self._cache: dict[str, tuple[str, dict]] = {}
 
     @staticmethod
     def matches(url: str) -> bool:
@@ -243,8 +252,41 @@ class EightComicSite(Site):
 
     # ---- 数据串 ----
 
-    def _load_data(self, cid: str, session: requests.Session) -> tuple[str, int]:
-        """取回并缓存某部漫画的章节数据串，返回 (数据串, 章节数)。"""
+    def _parse_layout(self, html: str) -> dict:
+        """从页面内联脚本读出这部漫画的记录布局。
+
+        按语义认字段（URL 里谁被当图床号用、谁被当 code 用），而不是按固定
+        位置猜——位置是随漫画变的。认不出就报错，绝不用猜的布局硬算：
+        那只会生成一堆 404，比直接失败更难排查。
+        """
+        m = self._SUDEF_RE.search(html)
+        su_default = int(m.group(1)) if m else 40
+        fields = {name: (int(off), int(ln) if ln else su_default)
+                  for name, off, ln in self._FIELD_RE.findall(html)}
+
+        sd_m, code_m = self._SD_RE.search(html), self._CODE_RE.search(html)
+        part_m, loop_m = self._PART_RE.search(html), self._LOOP_RE.search(html)
+        if not (fields and sd_m and code_m and part_m and loop_m):
+            raise ScrapeError("认不出章节记录的布局，站点脚本可能已改版")
+
+        missing = [v.group(1) for v in (sd_m, code_m, part_m)
+                   if v.group(1) not in fields]
+        if missing:
+            raise ScrapeError(f"字段 {missing} 不在记录里，站点脚本可能已改版")
+
+        pages_m = self._PAGES_RE.search(html)
+        by_off = {off: (off, ln) for off, ln in fields.values()}
+        pages = (fields.get(pages_m.group(1)) if pages_m else None) or by_off.get(2)
+        ch = by_off.get(0)
+        if ch is None or pages is None:
+            raise ScrapeError("记录里找不到章节号或页数字段，站点脚本可能已改版")
+
+        return {"count": int(loop_m.group(1)), "ch": ch, "pages": pages,
+                "code": fields[code_m.group(1)], "sd": fields[sd_m.group(1)],
+                "part": fields[part_m.group(1)]}
+
+    def _load_data(self, cid: str, session: requests.Session) -> tuple[str, dict]:
+        """取回并缓存某部漫画的数据串与布局，返回 (数据串, 布局)。"""
         if cid in self._cache:
             return self._cache[cid]
 
@@ -262,33 +304,36 @@ class EightComicSite(Site):
                 "8comic 此时会返回一个状态码 200 的伪装页；也可能是站点已改版。")
         data = max(cands, key=len)
 
-        m = self._CHS_RE.search(html)
-        chs = int(m.group(1)) if m else len(data) // self._REC
-        if chs < 1 or len(data) < chs * self._REC:
+        layout = self._parse_layout(html)
+        need = layout["count"] * self._REC
+        if layout["count"] < 1 or len(data) < need:
             raise ScrapeError(
-                f"数据串长度 {len(data)} 放不下声明的 {chs} 章，站点算法可能已改")
+                f"数据串长度 {len(data)} 放不下 {layout['count']} 条记录，"
+                "站点算法可能已改")
 
-        self._cache[cid] = (data, chs)
-        return data, chs
+        self._cache[cid] = (data, layout)
+        return data, layout
 
-    def _record(self, data: str, i: int) -> dict:
-        """切出第 i 条（从 0 起）章节记录。"""
+    def _record(self, data: str, i: int, layout: dict) -> dict:
+        """按布局切出第 i 条（从 0 起）章节记录。"""
         rec = data[i * self._REC:(i + 1) * self._REC]
         cut = lambda f: rec[f[0]:f[0] + f[1]]
         return {
-            "ch": self._lc(cut(self._F_CH)),
-            "pages": self._lc(cut(self._F_PAGES)),
-            "code": cut(self._F_CODE),
-            "sd": str(self._lc(cut(self._F_SD))),
-            "part": cut(self._F_PART),
+            "ch": self._lc(cut(layout["ch"])),
+            "pages": self._lc(cut(layout["pages"])),
+            "code": cut(layout["code"]),
+            "sd": str(self._lc(cut(layout["sd"]))),
+            "part": cut(layout["part"]),
         }
 
     def _build_urls(self, data: str, cid: str, rec: dict) -> list[str]:
         """按站点内联脚本的模板拼出整章的图片直链。"""
         f1, f2, f3, f4 = (self._frag(data, n) for n in (1, 2, 3, 4))
         sd = rec["sd"]
-        if len(sd) < 2:
-            raise ScrapeError(f"图床号异常: {sd!r}，站点算法可能已改")
+        if len(sd) < 2 or not sd.isdigit():
+            raise ScrapeError(
+                f"图床号异常: {sd!r}（应是两位以上的数字）。"
+                "多半是记录布局认错了，站点脚本可能已改版")
 
         host = f"{f4}{sd[0]}.8{f3}{f2}{f3}"          # 例：img7.8comic.com
         suffix = "" if rec["part"] == "0" else rec["part"]
@@ -342,12 +387,14 @@ class EightComicSite(Site):
             raise ScrapeError(f"认不出的章节地址: {chapter_url}")
         cid = m.group(1)
 
-        data, chs = self._load_data(cid, session)
-        for i in range(chs):
-            rec = self._record(data, i)
+        data, layout = self._load_data(cid, session)
+        for i in range(layout["count"]):
+            rec = self._record(data, i, layout)
             if str(rec["ch"]) == str(ch):
                 return self._build_urls(data, cid, rec)
-        raise ScrapeError(f"数据串里找不到第 {ch} 章（共 {chs} 章）")
+        raise ScrapeError(
+            f"数据串里找不到第 {ch} 章（数据里共 {layout['count']} 章）。"
+            "目录页可能列出了尚未上线的章节。")
 
 
 # ------------------------------------------------------------------ 路由
