@@ -48,11 +48,17 @@ _EXT_BY_TYPE = {
 
 
 def make_session(proxy: str | None = None,
-                 site: sites.Site | None = None) -> requests.Session:
-    """带自动重试的 Session。proxy 传 None 即直连（默认就够用）。
+                 site: sites.Site | None = None,
+                 no_proxy: bool = False) -> requests.Session:
+    """带自动重试的 Session。
 
     site 决定额外的请求头——各站要求不同：manwame 的图片 CDN 强制校验
     Referer，8comic 的章节页不带 Referer 会返回伪装页。
+
+    代理按这个优先级定：显式 proxy > no_proxy > 站点的 prefer_direct >
+    环境变量。之所以让站点能声明「默认直连」：requests 会自动读
+    http_proxy/https_proxy，而华语区站点走翻墙代理常常反而不通
+    （manhuagui 实测走代理 ReadTimeout、直连 0.7 秒就 200）。
     """
     s = requests.Session()
     s.headers.update(sites.default_headers(site))
@@ -68,6 +74,8 @@ def make_session(proxy: str | None = None,
     s.mount("http://", adapter)
     if proxy:
         s.proxies.update({"http": proxy, "https": proxy})
+    elif no_proxy or (site is not None and site.prefer_direct):
+        s.trust_env = False  # 连环境里的 http_proxy/https_proxy 也不读
     return s
 
 
@@ -135,14 +143,14 @@ def download_chapter(chapter: Chapter, out_dir: str, session: requests.Session,
 def download_comic(book_url: str, out_root: str = "downloads",
                    chapters: Iterable[int] | None = None,
                    workers: int = 4, delay: float = 0.15,
-                   proxy: str | None = None,
+                   proxy: str | None = None, no_proxy: bool = False,
                    on_progress: Callable[[str], None] = print) -> str:
     """完整流程。chapters 传章节序号集合可只下指定章；None 表示全下。
 
     on_progress 是进度回调，接 WebUI 时换成往队列里塞消息即可。
     """
     site = pick_site(book_url)
-    session = make_session(proxy, site)
+    session = make_session(proxy, site, no_proxy)
     comic = site.fetch_chapters(book_url, session)
     out_dir = os.path.join(out_root, comic.name)
     os.makedirs(out_dir, exist_ok=True)
@@ -175,6 +183,7 @@ def _reachable(session: requests.Session, url: str):
 
 
 def probe(book_url: str, proxy: str | None = None, samples: int = 3,
+          no_proxy: bool = False,
           on_progress: Callable[[str], None] = print) -> bool:
     """下载前预检：解析布局、抽样生成图片地址并实际请求，确认这部能下。
 
@@ -183,10 +192,11 @@ def probe(book_url: str, proxy: str | None = None, samples: int = 3,
     预检把它提前到几秒钟内，并把认出来的布局打出来，出问题时就是最直接的线索。
     """
     site = pick_site(book_url)
-    session = make_session(proxy, site)
+    session = make_session(proxy, site, no_proxy)
 
     comic = site.fetch_chapters(book_url, session)
-    on_progress(f"[{site.name}] 《{comic.name}》 {len(comic.chapters)} 章")
+    on_progress(f"[{site.name}] 《{comic.name}》 {len(comic.chapters)} 章"
+                + ("  (直连，未走环境代理)" if not session.trust_env and not proxy else ""))
     for line in site.diagnose(comic, session):
         on_progress(f"  {line}")
 
@@ -424,7 +434,9 @@ if __name__ == "__main__":
 
     p_list = sub.add_parser("list", help="列出章节，不下载")
     p_list.add_argument("url", help="漫画目录页 URL")
-    p_list.add_argument("--proxy", help="代理地址（默认直连）")
+    p_list.add_argument("--proxy", help="代理地址")
+    p_list.add_argument("--no-proxy", action="store_true",
+                       help="强制直连，忽略 http_proxy/https_proxy 环境变量")
 
     p_dl = sub.add_parser("download", help="下载章节到文件夹（不自动打包）")
     p_dl.add_argument("url", help="漫画目录页 URL")
@@ -432,14 +444,18 @@ if __name__ == "__main__":
     p_dl.add_argument("-c", "--chapters", help="章节范围，如 1-10 或 1,3,5；省略为全部")
     p_dl.add_argument("-w", "--workers", type=int, default=4, help="每章并发下载数")
     p_dl.add_argument("-d", "--delay", type=float, default=0.15, help="每张图后的间隔秒数")
-    p_dl.add_argument("--proxy", help="代理地址（默认直连）")
+    p_dl.add_argument("--proxy", help="代理地址")
+    p_dl.add_argument("--no-proxy", action="store_true",
+                       help="强制直连，忽略 http_proxy/https_proxy 环境变量")
 
     sub.add_parser("sites", help="列出支持的站点和 URL 形态")
 
     p_prb = sub.add_parser("probe", help="下载前预检：确认这部漫画现在能正常下")
     p_prb.add_argument("url", help="漫画目录页 URL")
     p_prb.add_argument("-n", "--samples", type=int, default=3, help="抽查几章")
-    p_prb.add_argument("--proxy", help="代理地址（默认直连）")
+    p_prb.add_argument("--proxy", help="代理地址")
+    p_prb.add_argument("--no-proxy", action="store_true",
+                       help="强制直连，忽略 http_proxy/https_proxy 环境变量")
 
     p_chk = sub.add_parser("check", help="列出已下载的章节和图片数，供人工核对")
     p_chk.add_argument("dir", help="漫画目录，如 downloads/<漫画名>")
@@ -456,7 +472,8 @@ if __name__ == "__main__":
     try:
         if args.cmd == "list":
             site = pick_site(args.url)
-            comic = site.fetch_chapters(args.url, make_session(args.proxy, site))
+            comic = site.fetch_chapters(
+                args.url, make_session(args.proxy, site, args.no_proxy))
             print(f"[{site.name}] 《{comic.name}》 {len(comic.chapters)} 章")
             for c in comic.chapters:
                 print(f"  {c.index:3d}  {c.title}")
@@ -464,7 +481,8 @@ if __name__ == "__main__":
         elif args.cmd == "download":
             out_dir = download_comic(args.url, args.out,
                                      parse_chapter_spec(args.chapters),
-                                     args.workers, args.delay, args.proxy)
+                                     args.workers, args.delay, args.proxy,
+                                     args.no_proxy)
             print(f"\n请人工检查 {out_dir}，确认无误后运行：")
             print(f"  python scraper.py pack \"{out_dir}\"")
 
@@ -473,7 +491,8 @@ if __name__ == "__main__":
                 print(line)
 
         elif args.cmd == "probe":
-            raise SystemExit(0 if probe(args.url, args.proxy, args.samples) else 1)
+            raise SystemExit(
+                0 if probe(args.url, args.proxy, args.samples, args.no_proxy) else 1)
 
         elif args.cmd == "check":
             rows = scan_downloaded(args.dir)
@@ -497,5 +516,11 @@ if __name__ == "__main__":
         raise SystemExit(f"错误: {exc}")
     except ValueError as exc:
         raise SystemExit(f"参数错误: {exc}")
+    except requests.exceptions.RequestException as exc:
+        # 连不上时最常见的原因就是代理，直接把话说明白
+        raise SystemExit(
+            f"网络错误: {type(exc).__name__}\n"
+            "连不上站点。若设了 http_proxy/https_proxy，有些站点走代理反而不通，"
+            "试试加 --no-proxy；反过来要走代理则加 --proxy http://…")
     except KeyboardInterrupt:
         raise SystemExit("\n已中断。已完成的部分保留，重跑同一命令可继续。")

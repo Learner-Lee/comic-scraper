@@ -25,7 +25,10 @@ app = Flask(__name__)
 DOWNLOAD_ROOT = os.path.abspath(os.environ.get("COMIC_OUT", "downloads"))
 DEFAULT_WORKERS = int(os.environ.get("COMIC_WORKERS", "4"))
 DEFAULT_DELAY = float(os.environ.get("COMIC_DELAY", "0.15"))
-PROXY = os.environ.get("COMIC_PROXY") or None  # 默认直连
+PROXY = os.environ.get("COMIC_PROXY") or None  # 默认跟随环境变量
+# 设为 1 则对所有站点强制直连。单个站点也可以自己声明 prefer_direct
+# （manhuagui 就是这样：走翻墙代理会超时，直连才通）
+NO_PROXY = os.environ.get("COMIC_NO_PROXY", "").strip() in ("1", "true", "yes")
 
 
 class Job:
@@ -108,7 +111,7 @@ def _run_download(url: str, picked: set[int] | None,
                   workers: int, delay: float) -> None:
     try:
         site = scraper.pick_site(url)
-        session = scraper.make_session(PROXY, site)
+        session = scraper.make_session(PROXY, site, NO_PROXY)
         comic = site.fetch_chapters(url, session)
         todo = [c for c in comic.chapters
                 if picked is None or c.index in picked]
@@ -207,7 +210,7 @@ def api_chapters():
     except scraper.ScrapeError as exc:
         return jsonify({"error": str(exc)}), 400
     try:
-        comic = site.fetch_chapters(url, scraper.make_session(PROXY, site))
+        comic = site.fetch_chapters(url, scraper.make_session(PROXY, site, NO_PROXY))
     except Exception as exc:
         return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 502
     return jsonify({
@@ -293,6 +296,6 @@ if __name__ == "__main__":
 
     os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
     print(f"输出目录: {DOWNLOAD_ROOT}")
-    print(f"代理: {PROXY or '直连'}")
+    print(f"代理: {PROXY or ('强制直连' if NO_PROXY else '跟随环境变量')}")
     print(f"打开 http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
