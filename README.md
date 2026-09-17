@@ -6,6 +6,15 @@
 |---|---|
 | manwame.com | `https://manwame.com/book/<名字>-<id>` |
 | 8comic.com（無限動漫） | `https://www.8comic.com/html/<id>.html` |
+| m.manhuagui.com（看漫画 / 漫画柜） | `https://m.manhuagui.com/comic/<id>/` |
+
+随时可以查：
+
+```bash
+python scraper.py sites          # 列出支持的站点、URL 形态和示例
+```
+
+贴了不支持的 URL 时，报错里也会带上这份清单。
 
 **流程：** 获取章节 → 下载到文件夹 → **人工检查** → 按章节打包 ZIP
 
@@ -29,6 +38,7 @@ pip install -r requirements.txt
 ## 命令行
 
 ```bash
+python scraper.py sites                           # 支持哪些站点
 python scraper.py probe <URL>                     # 下载前预检（建议先跑）
 python scraper.py list <URL>                      # 列出章节
 python scraper.py download <URL>                  # 下载全部
@@ -110,10 +120,13 @@ python app.py                   # http://127.0.0.1:60001
 |---|---|
 | `scraper.py` | 通用流程（下载、断点续传、打包、校验）+ 命令行入口 |
 | `sites.py` | 站点适配器：各站怎么拿章节列表、怎么拿图片直链 |
+| `lzstring.py` | LZString 解压，manhuagui 的字典要用 |
 | `app.py` | Flask Web 界面 |
 | `templates/app.html` | 前端单页 |
 
-加新站点只需在 `sites.py` 写一个 `Site` 子类并挂进 `_SITES`，别处一行都不用改。
+加新站点只需在 `sites.py` 写一个 `Site` 子类并挂进 `_SITES`，别处一行都不用改——
+`sites` 命令、WebUI 的清单、报错提示都会自动带上它（记得填 `label`／`url_hint`／
+`example`／`notes` 四个类属性）。
 
 ## 工作原理
 
@@ -124,6 +137,23 @@ python app.py                   # http://127.0.0.1:60001
 1. **章节目录**是服务端直出的 HTML，用 `[data-chapter-list] a` 选择器即可解析，不需要浏览器内核。
 2. **章节图片**不在 HTML 里，而是 AES-128-CBC 加密后放在页面的 `params` 变量中。IV 是 base64 解码后的前 16 字节，密文是其余部分，解密得到含 `chapter_images`（图片 token）和 `images_hosts`（CDN 域名）的 JSON。
 3. **图片 CDN 强制校验 Referer**，不带会返回 403（页面 HTML 里的 `referrerpolicy="no-referrer"` 是误导）。
+
+### m.manhuagui.com
+
+1. **章节目录**直出 HTML，取 `.chapter-list a`。站点按最新在前排列，要反转成阅读顺序。
+2. **图片数据裹了三层**，每层都是确定性的：
+   - `eval` 被写成 `window["\x65\x76\x61\x6c"](…)`，grep `eval` 是搜不到的
+   - 里面是标准的 Dean Edwards packer
+   - packer 的字典不是寻常的 `'a|b'.split('|')`，而是一个 base64 串调
+     `['\x73\x70\x6c\x69\x63']('|')`——解码出来是 `splic`，站点自定义的方法，
+     实为 **LZString 解压后再 split**
+3. **有个现成的正确性校验**：字典解压后的项数必须等于 packer 声明的 `count`，
+   对不上就是解错了，程序会直接报错而不是硬算。
+4. **图片地址带时效签名**（`sl.e` 是过期时间戳），所以数据不缓存、每章现取。
+5. **路径编码要小心**：同一条路径里，中文章节名是未编码的，而有些文件名在站点
+   数据里**已经是编码过的**。所以编码时必须把 `%` 放进 safe，否则会二次编码成
+   `%25xx`，取回来是 404。
+6. 图床强制校验 Referer，不带直接 403。图片格式是 webp。
 
 ### 8comic.com
 
@@ -152,6 +182,15 @@ AES 密钥是从站点前端 `cms.js` 提取的硬编码值。站点若更换密
 重新提取方法：打开任意章节页，在浏览器控制台执行 `CMS.chapter.decrypt(params)` 对照，或用 Node 加载 `cms.js` 后钩住 `CryptoJS.AES.decrypt` 打印密钥。
 
 站点若改版导致目录解析失败，程序会报 `目录页没找到 [data-chapter-list]`，届时更新选择器即可。
+
+### manhuagui
+
+三层包装的每一层都是标准做法（packer、LZString），没有站点私有的魔法值，
+所以相对稳定。真要出问题，`_PACKED_RE` 那条正则是第一个要看的地方。
+
+`lzstring.py` 只实现了 `decompressFromBase64` 一个方向。之所以自带这 50 行而不装
+pip 包：算法公开且固定，为一个函数引入供应链风险不划算，正确性又有「项数 ==
+packer 的 count」这个现成校验兜底。
 
 ### 8comic
 

@@ -12,12 +12,14 @@ import base64
 import json
 import re
 from dataclasses import dataclass, field
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
+
+import lzstring
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
@@ -65,10 +67,18 @@ def safe_name(name: str, fallback: str = "untitled") -> str:
 
 
 class Site:
-    """站点适配器基类。子类只需实现下面两个 fetch_*。"""
+    """站点适配器基类。子类只需实现下面两个 fetch_*。
 
-    name = ""
-    home = ""
+    那几个类属性是给人看的：`sites` 命令和「不支持的站点」报错都从这里取，
+    新增站点时顺手填上，清单会自动带上它，不用再改别处。
+    """
+
+    name = ""          # 内部标识，也是日志里的前缀
+    home = ""          # 站点首页
+    label = ""         # 中文名
+    url_hint = ""      # 目录页 URL 长什么样
+    example = ""       # 一个能直接用的示例
+    notes = ""         # 这个站的脾气（加密方式、反爬点）
 
     @staticmethod
     def matches(url: str) -> bool:
@@ -97,6 +107,10 @@ class ManwameSite(Site):
 
     name = "manwame"
     home = "https://manwame.com"
+    label = "manwame"
+    url_hint = "https://manwame.com/book/<名字>-<id>"
+    example = "https://manwame.com/book/fengkuanghujingaixideqie-Gx63v"
+    notes = "图片 AES-128-CBC 加密；图床强制校验 Referer"
 
     # 站点前端 cms.js 里硬编码的 AES-128 密钥。若某天全站解密失败，多半是这里变了：
     # 在章节页源码找 params，用浏览器控制台跑 CMS.chapter.decrypt(params) 对照即可。
@@ -182,6 +196,10 @@ class EightComicSite(Site):
 
     name = "8comic"
     home = "https://www.8comic.com"
+    label = "無限動漫"
+    url_hint = "https://www.8comic.com/html/<id>.html"
+    example = "https://www.8comic.com/html/12539.html"
+    notes = "字段布局随机混淆、每次重新生成都会变；章节页不带 Referer 会返回 200 的伪装页"
 
     # 章节页地址取自站点 comicview.js 的 cview()：非 VIP 会被送到这个域名
     _VIEW = "https://articles.onemoreplace.tw/online/new-{cid}.html?ch={ch}"
@@ -472,9 +490,170 @@ class EightComicSite(Site):
             "目录页可能列出了尚未上线的章节。")
 
 
+# ------------------------------------------------------------------ manhuagui
+
+class ManhuaguiSite(Site):
+    """m.manhuagui.com（看漫画 / 漫画柜）。
+
+    图片数据裹了三层，每层都是确定性的：
+
+      1. eval 被写成 `window["\\x65\\x76\\x61\\x6c"](…)`，grep "eval" 是搜不到的
+      2. 里面是标准的 Dean Edwards packer
+      3. packer 的字典不是寻常的 'a|b'.split('|')，而是一个 base64 串调
+         `['\\x73\\x70\\x6c\\x69\\x63']('|')`——解码出来是 `splic`，站点自定义的方法，
+         实为 LZString 解压后再 split
+
+    另外两点脾气：图床不带 Referer 直接 403；图片地址带时效签名（sl.e 是过期
+    时间戳），所以数据不能长期缓存，每章现取。
+    """
+
+    name = "manhuagui"
+    home = "https://m.manhuagui.com"
+    label = "看漫画 / 漫画柜"
+    url_hint = "https://m.manhuagui.com/comic/<id>/"
+    example = "https://m.manhuagui.com/comic/53656/"
+    notes = "packer + LZString 三层包装；图床校验 Referer；图片地址带时效签名"
+
+    _IMG_HOST = "https://i.hamreus.com"
+    # 移动站，用桌面 UA 可能被导去别的版面
+    _MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                  "Mobile/15E148 Safari/604.1")
+
+    # }('<payload>',<base>,<count>,'<base64字典>'[…]('|'),0,{})
+    _PACKED_RE = re.compile(r"\}\('(.*?)',(\d+),(\d+),'([A-Za-z0-9+/=]+)'\[", re.S)
+    _JSON_RE = re.compile(r"\{.*\}", re.S)
+    _D36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+    @staticmethod
+    def matches(url: str) -> bool:
+        return urlparse(url).netloc.lower().endswith("manhuagui.com")
+
+    def headers(self) -> dict:
+        return {"Referer": self.home + "/", "User-Agent": self._MOBILE_UA}
+
+    @classmethod
+    def _key(cls, n: int, base: int) -> str:
+        """packer 里的 e(c)：把序号编成短标识，用来在 payload 里占位。"""
+        head = "" if n < base else cls._key(n // base, base)
+        n %= base
+        return head + (chr(n + 29) if n > 35 else cls._D36[n])
+
+    def _unpack(self, html: str) -> dict:
+        """拆掉三层包装，取出图片数据 JSON。"""
+        m = self._PACKED_RE.search(html)
+        if not m:
+            raise ScrapeError("章节页找不到打包的图片数据，站点结构可能已改版")
+        payload, base, count, blob = (m.group(1), int(m.group(2)),
+                                      int(m.group(3)), m.group(4))
+
+        try:
+            words = lzstring.decompress_from_base64(blob).split("|")
+        except lzstring.LZStringError as exc:
+            raise ScrapeError(f"字典解压失败: {exc}") from exc
+
+        # 解出来的词数必须和 packer 自己声明的 count 对上。这是现成的正确性
+        # 校验：对不上就是解错了，此时硬算只会得到一堆垃圾路径。
+        if len(words) != count:
+            raise ScrapeError(
+                f"字典解出 {len(words)} 项，但 packer 声明 {count} 项，"
+                "站点算法可能已改版")
+
+        for i in range(count - 1, -1, -1):
+            word = words[i]
+            if not word:
+                continue
+            # 用 lambda 回填，免得词里的反斜杠被当成替换语法
+            payload = re.sub(r"\b" + re.escape(self._key(i, base)) + r"\b",
+                             lambda _m, w=word: w, payload)
+
+        m2 = self._JSON_RE.search(payload)
+        if not m2:
+            raise ScrapeError("解包后没找到图片数据 JSON，站点结构可能已改版")
+        try:
+            return json.loads(m2.group(0))
+        except ValueError as exc:
+            raise ScrapeError(f"图片数据 JSON 解析失败: {exc}") from exc
+
+    def fetch_chapters(self, book_url: str, session: requests.Session) -> Comic:
+        resp = session.get(book_url, timeout=20)
+        resp.raise_for_status()
+        soup = BeautifulSoup(html_text(resp), "html.parser")
+
+        h1 = soup.select_one("h1")
+        name = safe_name(h1.get_text(strip=True) if h1 else "", "comic")
+
+        links = soup.select(".chapter-list a[href]")
+        if not links:
+            raise ScrapeError("目录页没找到 .chapter-list，站点结构可能已改版")
+
+        # 站点按最新在前排列，反过来才是阅读顺序
+        chapters: list[Chapter] = []
+        for a in reversed(links):
+            chapters.append(Chapter(
+                url=urljoin(self.home, a["href"]),
+                title=safe_name(a.get_text(strip=True),
+                                f"chapter_{len(chapters) + 1}"),
+                index=len(chapters) + 1))
+        if not chapters:
+            raise ScrapeError("目录里一章都没解析到")
+        return Comic(name=name, url=book_url, chapters=chapters)
+
+    def fetch_chapter_images(self, chapter_url: str,
+                             session: requests.Session) -> list[str]:
+        resp = session.get(chapter_url, timeout=20)
+        resp.raise_for_status()
+        data = self._unpack(html_text(resp))
+
+        images = data.get("images") or []
+        sl = data.get("sl") or {}
+        if not images:
+            raise ScrapeError(f"这一章没有图片: {chapter_url}")
+        if not (sl.get("e") and sl.get("m")):
+            raise ScrapeError("缺少图片签名参数 sl，站点算法可能已改版")
+
+        # 路径里的中文章节名要编码，但有些文件名在站点数据里**已经是编码过的**
+        # （同一条路径里混着两种状态），所以 % 必须放进 safe，否则会二次编码
+        # 成 %25xx，取回来是 404。签名有时效，所以每章现取、不缓存。
+        query = f"?e={sl['e']}&m={sl['m']}"
+        return [f"{self._IMG_HOST}{quote(path, safe='/%')}{query}"
+                for path in images]
+
+
 # ------------------------------------------------------------------ 路由
 
-_SITES: tuple[type[Site], ...] = (ManwameSite, EightComicSite)
+_SITES: tuple[type[Site], ...] = (ManwameSite, EightComicSite, ManhuaguiSite)
+
+
+def all_sites() -> tuple[type[Site], ...]:
+    """目前支持的站点。"""
+    return _SITES
+
+
+def describe_sites() -> list[str]:
+    """把站点清单排成给人看的几行。
+
+    `sites` 命令和「不支持的站点」报错共用这一份——贴错 URL 的时候，正需要
+    看到该贴成什么样，所以报错里直接把清单带上。
+    """
+    width = max(len(c.name) for c in _SITES)
+    pad = " " * (width + 4)
+    lines = [f"支持 {len(_SITES)} 个站点："]
+    for c in _SITES:
+        lines += ["",
+                  f"  {c.name.ljust(width)}  {c.label}",
+                  f"{pad}目录页  {c.url_hint}",
+                  f"{pad}示例    {c.example}"]
+        if c.notes:
+            lines.append(f"{pad}特点    {c.notes}")
+    return lines
+
+
+def site_table() -> list[dict]:
+    """同一份清单的结构化版本，给 WebUI 用。"""
+    return [{"name": c.name, "label": c.label, "home": c.home,
+             "url_hint": c.url_hint, "example": c.example, "notes": c.notes}
+            for c in _SITES]
 
 
 def pick_site(url: str) -> Site:
@@ -482,8 +661,7 @@ def pick_site(url: str) -> Site:
     for cls in _SITES:
         if cls.matches(url):
             return cls()
-    supported = "、".join(c.home for c in _SITES)
-    raise ScrapeError(f"不支持的站点: {url}\n目前支持：{supported}")
+    raise ScrapeError("不支持的站点: " + url + "\n\n" + "\n".join(describe_sites()))
 
 
 def default_headers(site: Site | None = None) -> dict:

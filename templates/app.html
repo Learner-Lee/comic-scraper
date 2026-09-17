@@ -48,6 +48,13 @@
   #chapters { max-height: 200px; overflow: auto; margin-bottom: 12px; font-size: 13px; }
   #chapters div { padding: 1px 0; }
   .hint { font-size: 12px; opacity: .65; margin-top: 8px; }
+  details.sites { margin-top: 12px; font-size: 13px; }
+  details.sites summary { cursor: pointer; opacity: .75; }
+  details.sites table { margin-top: 10px; }
+  details.sites td { padding: 4px 10px 4px 0; vertical-align: top; }
+  details.sites td.nm { white-space: nowrap; font-weight: 600; }
+  details.sites code { font-size: 12px; opacity: .85; }
+  details.sites .nt { font-size: 12px; opacity: .6; }
   .opts { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
   .opts label {
     display: flex; align-items: center; gap: 6px;
@@ -83,6 +90,21 @@
     <span id="fetchMsg" class="hint"></span>
   </div>
   <div id="chapters"></div>
+  <details class="sites">
+    <summary>支持哪些站点？（{{ sites|length }} 个）</summary>
+    <table>
+      {% for s in sites %}
+      <tr>
+        <td class="nm">{{ s.name }}<br><span class="nt">{{ s.label }}</span></td>
+        <td>
+          <code>{{ s.url_hint }}</code><br>
+          <span class="nt">示例 <code>{{ s.example }}</code></span>
+          {% if s.notes %}<br><span class="nt">{{ s.notes }}</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+  </details>
 </fieldset>
 
 <fieldset>

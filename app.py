@@ -185,7 +185,14 @@ def _opt_num(data: dict, key: str, default, cast, lo, hi):
 @app.route("/")
 def index():
     return render_template("app.html", out_root=DOWNLOAD_ROOT,
-                           def_workers=DEFAULT_WORKERS, def_delay=DEFAULT_DELAY)
+                           def_workers=DEFAULT_WORKERS, def_delay=DEFAULT_DELAY,
+                           sites=scraper.site_table())
+
+
+@app.get("/api/sites")
+def api_sites():
+    """支持的站点清单。"""
+    return jsonify({"sites": scraper.site_table()})
 
 
 @app.post("/api/chapters")

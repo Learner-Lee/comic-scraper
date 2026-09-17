@@ -26,13 +26,15 @@ from urllib3.util.retry import Retry
 
 import sites
 # 重新导出，让外部（app.py 等）继续用 scraper.X
-from sites import Chapter, Comic, ScrapeError, Site, pick_site, safe_name
+from sites import (Chapter, Comic, ScrapeError, Site, all_sites,
+                   describe_sites, pick_site, safe_name, site_table)
 
 __all__ = [
     "Chapter", "Comic", "ScrapeError", "Site", "pick_site", "safe_name",
     "make_session", "fetch_chapters", "fetch_chapter_images",
     "download_chapter", "download_comic", "probe", "parse_chapter_spec",
-    "scan_downloaded", "pack_chapters",
+    "scan_downloaded", "pack_chapters", "all_sites", "describe_sites",
+    "site_table",
 ]
 
 _EXT_BY_TYPE = {
@@ -432,6 +434,8 @@ if __name__ == "__main__":
     p_dl.add_argument("-d", "--delay", type=float, default=0.15, help="每张图后的间隔秒数")
     p_dl.add_argument("--proxy", help="代理地址（默认直连）")
 
+    sub.add_parser("sites", help="列出支持的站点和 URL 形态")
+
     p_prb = sub.add_parser("probe", help="下载前预检：确认这部漫画现在能正常下")
     p_prb.add_argument("url", help="漫画目录页 URL")
     p_prb.add_argument("-n", "--samples", type=int, default=3, help="抽查几章")
@@ -463,6 +467,10 @@ if __name__ == "__main__":
                                      args.workers, args.delay, args.proxy)
             print(f"\n请人工检查 {out_dir}，确认无误后运行：")
             print(f"  python scraper.py pack \"{out_dir}\"")
+
+        elif args.cmd == "sites":
+            for line in describe_sites():
+                print(line)
 
         elif args.cmd == "probe":
             raise SystemExit(0 if probe(args.url, args.proxy, args.samples) else 1)
