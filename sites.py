@@ -80,10 +80,6 @@ class Site:
     example = ""       # 一个能直接用的示例
     notes = ""         # 这个站的脾气（加密方式、反爬点）
 
-    # True 表示默认不读环境里的 http_proxy/https_proxy。华语区站点走翻墙代理
-    # 常常反而不通（出口到站点的路由断了），直连才正常。显式传 --proxy 仍优先。
-    prefer_direct = False
-
     @staticmethod
     def matches(url: str) -> bool:
         raise NotImplementedError
@@ -517,8 +513,6 @@ class ManhuaguiSite(Site):
     url_hint = "https://m.manhuagui.com/comic/<id>/"
     example = "https://m.manhuagui.com/comic/53656/"
     notes = "packer + LZString 三层包装；图床校验 Referer；图片地址带时效签名"
-    # 实测走本地翻墙代理会 ReadTimeout，直连 0.7 秒 200，所以默认绕开环境代理
-    prefer_direct = True
 
     _IMG_HOST = "https://i.hamreus.com"
     # 移动站，用桌面 UA 可能被导去别的版面

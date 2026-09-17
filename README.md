@@ -64,28 +64,22 @@ python scraper.py pack downloads/<漫画名>          # 确认后按章节打包
 | `-o, --out` | `downloads` | 输出根目录 |
 | `-w, --workers` | `4` | 每章并发下载数 |
 | `-d, --delay` | `0.15` | 每张图后的间隔秒数 |
-| `--proxy` | 无 | 走指定代理 |
-| `--no-proxy` | — | 强制直连，忽略 `http_proxy`/`https_proxy` 环境变量 |
+| `--proxy` | 无 | 走指定代理（默认一律直连） |
 
 ## 关于代理
 
-requests 会自动读 `http_proxy` / `https_proxy` 环境变量，而**华语区站点走翻墙代理
-常常反而不通**——manhuagui 实测走本地代理 `ReadTimeout`，直连 0.7 秒就 200。
+**本项目一律直连**，不读系统的 `http_proxy` / `https_proxy`（`trust_env=False`）。
 
-所以 manhuagui 默认**绕开环境代理**（`Site.prefer_direct`），probe 时会标注
-「直连，未走环境代理」。其余站点跟随环境变量。
+这么定是因为抓的都是华语区站点，走翻墙代理常常反而不通——manhuagui 实测走本地
+代理 `ReadTimeout`，直连 0.7 秒就 200。所以开着 v2ray 之类也不会影响本项目。
 
-优先级：`--proxy` > `--no-proxy` > 站点的 `prefer_direct` > 环境变量。
+确实需要代理时显式指定，这是唯一入口：
 
-连不上时程序会直接提示这一点，不用自己猜：
-
-```
-网络错误: ConnectionError
-连不上站点。若设了 http_proxy/https_proxy，有些站点走代理反而不通，
-试试加 --no-proxy；反过来要走代理则加 --proxy http://…
+```bash
+python scraper.py download <URL> --proxy http://127.0.0.1:10808
 ```
 
-WebUI 用环境变量 `COMIC_NO_PROXY=1` 可对所有站点强制直连。
+WebUI 则设 `COMIC_PROXY`。
 
 **断点续传**：已存在的图片会跳过。下载中断或发现某章缺图，重跑同一条 `download` 命令即可只补缺失部分。
 
