@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import time
 import zipfile
@@ -35,8 +34,7 @@ __all__ = [
     "make_session", "fetch_chapters", "fetch_chapter_images",
     "download_chapter", "download_comic", "probe", "parse_chapter_spec",
     "scan_downloaded", "pack_chapters", "all_sites", "describe_sites",
-    "site_table", "Gap", "scan_gaps", "repair_comic",
-    "Failure", "retry_failures",
+    "site_table", "Failure", "retry_failures",
 ]
 
 _EXT_BY_TYPE = {
@@ -287,224 +285,6 @@ def probe(book_url: str, proxy: str | None = None, samples: int = 3,
     return all_ok
 
 
-_SEQ_RE = re.compile(r"(\d{4})\.")      # 图片文件名：0001.jpg / 0001.webp
-_CH_DIR_RE = re.compile(r"(\d{3}) (.+)")  # 章节名：001 第01话
-
-
-@dataclass
-class Gap:
-    """某一章的缺口。"""
-    name: str              # 本地章节名（zip 的话是去掉扩展名的）
-    index: int             # 章节序号
-    path: str              # 本地真实路径（目录，或 .zip/.cbz 文件）
-    local: int             # 本地张数
-    remote: int            # 站点张数
-    missing: list[int]     # 缺的序号
-    packed: bool           # 本地是 zip 还是目录
-
-
-def _have_in_dir(chapter_dir: str) -> set[int]:
-    """目录里已有的图片序号。只看 4 位序号，不比扩展名——补下来的扩展名由
-    Content-Type 决定，可能和原有的不一样。"""
-    return {int(m.group(1)) for f in os.listdir(chapter_dir)
-            if not f.startswith(".") and not f.endswith(".part")
-            and (m := _SEQ_RE.match(f))}
-
-
-def _have_in_zip(zip_path: str) -> set[int]:
-    """zip 里已有的图片序号。"""
-    with zipfile.ZipFile(zip_path) as zf:
-        names = zf.namelist()
-    return {int(m.group(1)) for n in names
-            if (m := _SEQ_RE.match(os.path.basename(n)))}
-
-
-def _local_chapters(comic_dir: str, include_packed: bool) -> dict[int, tuple[str, str, bool]]:
-    """本地章节：序号 -> (章节名, 路径, 是否已打包)。"""
-    found: dict[int, tuple[str, str, bool]] = {}
-    for entry in sorted(os.listdir(comic_dir)):
-        path = os.path.join(comic_dir, entry)
-        packed = entry.lower().endswith((".zip", ".cbz"))
-        if packed and not include_packed:
-            continue
-        if not packed and not os.path.isdir(path):
-            continue
-        name = os.path.splitext(entry)[0] if packed else entry
-        m = _CH_DIR_RE.match(name)
-        if m:
-            found[int(m.group(1))] = (name, path, packed)
-    return found
-
-
-def scan_gaps(comic_dir: str, comic: Comic, site: sites.Site,
-              session: requests.Session,
-              chapters: Iterable[int] | None = None,
-              include_packed: bool = True, delay: float = 0.15,
-              on_progress: Callable[[str], None] = print) -> list[Gap]:
-    """联网取每章真实页数，和本地比对，返回有缺口的章节。
-
-    为什么非得联网：本地只能看出「序号中间有缺口」，看不出**末尾缺图**——
-    那种情况序号是连续的，就是少了最后一张。只有站点说了才算。
-    """
-    local = _local_chapters(comic_dir, include_packed)
-    todo = sorted(local)
-    if chapters is not None:
-        picked = set(chapters)
-        todo = [i for i in todo if i in picked]
-    if not todo:
-        on_progress("本地没有可核对的章节")
-        return []
-
-    gaps: list[Gap] = []
-    for n, idx in enumerate(todo, start=1):
-        name, path, packed = local[idx]
-        tag = "zip" if packed else "目录"
-        head = f"  [{n}/{len(todo)}] {name} [{tag}]"
-
-        if idx > len(comic.chapters):
-            on_progress(f"{head} — 站点已无第 {idx} 章，跳过")
-            continue
-        ch = comic.chapters[idx - 1]
-
-        # 名字必须对得上。站点若增删过章节，序号就会错位，那时补图会把这一章的
-        # 图写进另一章——比不补更糟，所以对不上就跳过，绝不猜。
-        if name != f"{idx:03d} {ch.title}":
-            on_progress(f"{head} — 与站点第 {idx} 章「{ch.title}」对不上，"
-                        "跳过（站点章节可能有增减）")
-            continue
-
-        try:
-            remote = len(site.fetch_chapter_images(ch.url, session))
-        except ScrapeError as exc:
-            on_progress(f"{head} — 取站点页数失败: {exc}")
-            continue
-
-        have = _have_in_zip(path) if packed else _have_in_dir(path)
-        missing = [i for i in range(1, remote + 1) if i not in have]
-        if missing:
-            gaps.append(Gap(name, idx, path, len(have), remote, missing, packed))
-            shown = ", ".join(str(i) for i in missing[:10])
-            more = f" 等 {len(missing)} 张" if len(missing) > 10 else ""
-            on_progress(f"{head} — 本地 {len(have)} / 站点 {remote}，缺第 {shown}{more} 张")
-        else:
-            on_progress(f"{head} — {len(have)} 张，与站点一致")
-        if delay:
-            time.sleep(delay)
-    return gaps
-
-
-def _fetch_missing(urls: list[str], missing: list[int], dest: str,
-                   session: requests.Session, workers: int,
-                   delay: float) -> list[str]:
-    """把缺的那几张下到 dest，返回成功的文件路径。"""
-    got: list[str] = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_download_one, urls[i - 1], dest, i, session, delay)
-                   for i in missing if i <= len(urls)]
-        for fut in as_completed(futures):
-            path = fut.result()
-            if path:
-                got.append(path)
-    return got
-
-
-def _repair_zip(zip_path: str, urls: list[str], missing: list[int],
-                session: requests.Session, workers: int, delay: float) -> int:
-    """把缺的图补进已有的 zip，返回补进去的张数。
-
-    不解包重打包，而是**在副本上追加**：原 zip 全程不动，中断或校验失败都只是
-    丢掉临时文件。校验通过才原子替换——和打包时删源目录前的把关是同一个道理。
-    """
-    work = zip_path + ".fix"
-    shutil.rmtree(work, ignore_errors=True)
-    os.makedirs(work, exist_ok=True)
-    try:
-        got = _fetch_missing(urls, missing, work, session, workers, delay)
-        if not got:
-            return 0
-
-        part = zip_path + ".part"
-        try:
-            shutil.copy2(zip_path, part)
-            with zipfile.ZipFile(part, "a", zipfile.ZIP_STORED) as zf:
-                existing = set(zf.namelist())
-                for fp in sorted(got):
-                    base = os.path.basename(fp)
-                    if base not in existing:
-                        zf.write(fp, base)
-            with zipfile.ZipFile(part) as zf:
-                bad = zf.testzip()
-                if bad is not None:
-                    raise ScrapeError(f"补齐后的 zip 校验失败，损坏条目: {bad}")
-            os.replace(part, zip_path)
-            return len(got)
-        except BaseException:
-            if os.path.exists(part):
-                os.remove(part)
-            raise
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-
-
-def repair_comic(book_url: str, out_root: str = "downloads",
-                 comic_dir: str | None = None,
-                 chapters: Iterable[int] | None = None,
-                 include_packed: bool = True,
-                 workers: int = 4, delay: float = 0.15,
-                 proxy: str | None = None,
-                 on_progress: Callable[[str], None] = print) -> dict:
-    """检查并补齐缺失的图片。只补缺的那几张，不重下整章。"""
-    site = pick_site(book_url)
-    session = make_session(proxy, site)
-    comic = site.fetch_chapters(book_url, session)
-    if comic_dir is None:
-        comic_dir = os.path.join(out_root, comic.name)
-    if not os.path.isdir(comic_dir):
-        raise ScrapeError(f"目录不存在: {comic_dir}")
-
-    on_progress(f"[{site.name}] 《{comic.name}》站点共 {len(comic.chapters)} 章，"
-                f"开始核对 {comic_dir}")
-    gaps = scan_gaps(comic_dir, comic, site, session, chapters,
-                     include_packed, delay, on_progress)
-
-    total_missing = sum(len(g.missing) for g in gaps)
-    if not gaps:
-        on_progress("核对完毕：所有章节都和站点页数一致，无需补齐")
-        return {"chapters": 0, "missing": 0, "fixed": 0, "failed": 0}
-
-    on_progress(f"核对完毕：{len(gaps)} 章缺图，共缺 {total_missing} 张，开始补")
-    fixed = failed = 0
-    for n, gap in enumerate(gaps, start=1):
-        ch = comic.chapters[gap.index - 1]
-        head = f"  [{n}/{len(gaps)}] {gap.name}"
-        try:
-            # 重新取一次直链：manhuagui 的地址带时效签名，扫描阶段取的可能已过期
-            urls = site.fetch_chapter_images(ch.url, session)
-            if gap.packed:
-                got = _repair_zip(gap.path, urls, gap.missing,
-                                  session, workers, delay)
-            else:
-                got = len(_fetch_missing(urls, gap.missing, gap.path,
-                                         session, workers, delay))
-        except Exception as exc:
-            on_progress(f"{head} — 补齐失败: {type(exc).__name__}: {exc}")
-            failed += 1
-            continue
-
-        if got == len(gap.missing):
-            fixed += 1
-            on_progress(f"{head} — 补齐 {got} 张 OK")
-        else:
-            failed += 1
-            on_progress(f"{head} — 只补上 {got}/{len(gap.missing)} 张，稍后可重跑")
-
-    on_progress(f"补齐结束：{fixed} 章完成，{failed} 章未完成")
-    if failed:
-        on_progress("未完成的重跑本命令即可继续（已补上的不会重下）")
-    return {"chapters": len(gaps), "missing": total_missing,
-            "fixed": fixed, "failed": failed}
-
-
 def parse_chapter_spec(spec: str | None) -> set[int] | None:
     """把 '1-10,15,20-22' 解析成序号集合。None / 空 表示全选。
 
@@ -727,19 +507,6 @@ if __name__ == "__main__":
     p_prb.add_argument("-n", "--samples", type=int, default=3, help="抽查几章")
     p_prb.add_argument("--proxy", help="走指定代理（默认一律直连）")
 
-    p_rep = sub.add_parser(
-        "repair", help="联网核对每章页数，补齐缺失的图片（已打包的 zip 也能补）")
-    p_rep.add_argument("url", help="漫画目录页 URL")
-    p_rep.add_argument("-o", "--out", default="downloads", help="输出根目录")
-    p_rep.add_argument("-c", "--chapters",
-                       help="只核对指定章节，如 1-50；省略为全部")
-    p_rep.add_argument("-w", "--workers", type=int, default=4, help="并发下载数")
-    p_rep.add_argument("-d", "--delay", type=float, default=0.15,
-                       help="每次请求后的间隔秒数")
-    p_rep.add_argument("--skip-zip", action="store_true",
-                       help="跳过已打包的章节，只核对还是目录的")
-    p_rep.add_argument("--proxy", help="走指定代理（默认一律直连）")
-
     p_chk = sub.add_parser("check", help="列出已下载的章节和图片数，供人工核对")
     p_chk.add_argument("dir", help="漫画目录，如 downloads/<漫画名>")
 
@@ -774,14 +541,6 @@ if __name__ == "__main__":
 
         elif args.cmd == "probe":
             raise SystemExit(0 if probe(args.url, args.proxy, args.samples) else 1)
-
-        elif args.cmd == "repair":
-            stat = repair_comic(args.url, out_root=args.out,
-                                chapters=parse_chapter_spec(args.chapters),
-                                include_packed=not args.skip_zip,
-                                workers=args.workers, delay=args.delay,
-                                proxy=args.proxy)
-            raise SystemExit(1 if stat["failed"] else 0)
 
         elif args.cmd == "check":
             rows = scan_downloaded(args.dir)

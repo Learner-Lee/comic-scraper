@@ -44,8 +44,7 @@ python scraper.py list <URL>                      # 列出章节
 python scraper.py download <URL>                  # 下载全部
 python scraper.py download https://www.8comic.com/html/12539.html -c 1-5
 python scraper.py download <URL> -c 1-10,15       # 只下指定章节
-python scraper.py check downloads/<漫画名>         # 核对每章图片数（只看本地）
-python scraper.py repair <URL>                    # 联网核对真实页数并补齐缺图
+python scraper.py check downloads/<漫画名>         # 核对每章图片数
 python scraper.py pack downloads/<漫画名>          # 确认后按章节打包
 ```
 
@@ -99,41 +98,6 @@ WebUI 第 2 步有「重试失败的 N 张」按钮——平时是灰的，本�
 > 那样重试会失败——重跑一次 `download` 即可（会重新取直链）。
 
 **断点续传**：已存在的图片会跳过。下载中断或发现某章缺图，重跑同一条 `download` 命令即可只补缺失部分。
-
-## 补齐缺失的图片
-
-`check` 只看本地有几张，看不出**末尾缺图**——序号是连续的，就是少了最后一张。
-`repair` 联网取每章真实页数再比对，只补缺的那几张：
-
-```bash
-python scraper.py repair https://www.8comic.com/html/12539.html
-```
-
-```
-[8comic] 《唐三葬》站点共 47 章，开始核对 downloads/唐三葬
-  [1/3] 001 1話 [zip] — 6 张，与站点一致
-  [2/3] 002 2話 [zip] — 本地 9 / 站点 11，缺第 10, 11 张
-  [3/3] 003 3話 [目录] — 9 张，与站点一致
-核对完毕：1 章缺图，共缺 2 张，开始补
-  [1/1] 002 2話 — 补齐 2 张 OK
-```
-
-**已打包的 zip 也能补**：先复制成副本、在副本上追加、校验（条目数 + 逐条 CRC）
-通过才原子替换，原 zip 全程不动——中断或校验失败只会丢掉临时文件。
-
-| 参数 | 说明 |
-|---|---|
-| `-c` | 只核对指定章节，如 `1-50`（章节多时很有用） |
-| `--skip-zip` | 跳过已打包的，只核对还是目录的章节 |
-| `-w` / `-d` | 并发数 / 请求间隔 |
-
-**每章要一次请求**才能知道真实页数，所以比 `check` 慢得多：8comic 整部只需 1 次
-（数据串含全部章节），manwame 和 manhuagui 是每章 1 次。章节多的话建议配合 `-c` 分批。
-
-**安全性**：章节名与站点对不上时会跳过并报告，不会乱补——站点若增删过章节，
-序号就会错位，那时补图会把这一章的图写进另一章，比不补更糟。
-
-WebUI 第 3 步有对应的「检查并补齐缺图」按钮，和「含已打包的 zip」开关。
 
 ## 开新漫画前先 probe
 
