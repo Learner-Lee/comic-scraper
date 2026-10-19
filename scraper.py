@@ -36,6 +36,7 @@ __all__ = [
     "download_chapter", "download_comic", "probe", "parse_chapter_spec",
     "scan_downloaded", "pack_chapters", "all_sites", "describe_sites",
     "site_table", "Gap", "scan_gaps", "repair_comic",
+    "Failure", "retry_failures",
 ]
 
 _EXT_BY_TYPE = {
@@ -121,30 +122,78 @@ def _download_one(url: str, dest_dir: str, idx: int,
         return None
 
 
+@dataclass
+class Failure:
+    """本次下载里失败的一张图。重试只需要这几样东西。"""
+    chapter: str   # 章节名，显示用
+    dest: str      # 章节目录
+    idx: int       # 图片序号
+    url: str       # 直链
+
+
 def download_chapter(chapter: Chapter, out_dir: str, session: requests.Session,
                      workers: int = 4, delay: float = 0.15,
-                     site: sites.Site | None = None) -> tuple[int, int]:
-    """下载一章，返回 (成功数, 总数)。"""
+                     site: sites.Site | None = None,
+                     failures: list[Failure] | None = None) -> tuple[int, int]:
+    """下载一章，返回 (成功数, 总数)。
+
+    传了 failures 就把失败的图记进去，之后可以只重下这些，不必重来一遍。
+    """
     urls = fetch_chapter_images(chapter.url, session, site)
     dest = os.path.join(out_dir, f"{chapter.index:03d} {chapter.title}")
     os.makedirs(dest, exist_ok=True)
 
     ok = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_download_one, u, dest, i, session, delay)
-                   for i, u in enumerate(urls, start=1)]
+        futures = {pool.submit(_download_one, u, dest, i, session, delay): (u, i)
+                   for i, u in enumerate(urls, start=1)}
+        for fut in as_completed(futures):
+            url, idx = futures[fut]
+            if fut.result():
+                ok += 1
+            elif failures is not None:
+                failures.append(Failure(chapter.title, dest, idx, url))
+    return ok, len(urls)
+
+
+def retry_failures(failures: list[Failure], session: requests.Session,
+                   workers: int = 4, delay: float = 0.15,
+                   on_progress: Callable[[str], None] = print,
+                   remaining: list[Failure] | None = None) -> tuple[int, int]:
+    """重下之前失败的那几张。返回 (成功数, 总数)。
+
+    直接拿记下来的直链重试，不用再去解析章节页。已经存在的文件会被跳过，
+    所以重复调用是安全的。
+
+    一个已知限制：manhuagui 的直链带时效签名，本次下载跑太久的话记下的链接
+    可能已过期，那样重试会失败——重跑一次 download 即可（会重新取直链）。
+    """
+    if not failures:
+        return 0, 0
+    on_progress(f"重试本次失败的 {len(failures)} 张图片")
+    ok = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_download_one, f.url, f.dest, f.idx, session, delay): f
+                   for f in failures}
         for fut in as_completed(futures):
             if fut.result():
                 ok += 1
-    return ok, len(urls)
+            elif remaining is not None:
+                remaining.append(futures[fut])
+    still = len(failures) - ok
+    on_progress(f"重试结束：补上 {ok} 张"
+                + (f"，仍有 {still} 张没下来（可重跑 download 再试）" if still else "，全部成功"))
+    return ok, len(failures)
 
 
 def download_comic(book_url: str, out_root: str = "downloads",
                    chapters: Iterable[int] | None = None,
                    workers: int = 4, delay: float = 0.15,
-                   proxy: str | None = None,
+                   proxy: str | None = None, retry: bool = False,
                    on_progress: Callable[[str], None] = print) -> str:
     """完整流程。chapters 传章节序号集合可只下指定章；None 表示全下。
+
+    retry=True 时，全部下完后把失败的图再试一轮。
 
     on_progress 是进度回调，接 WebUI 时换成往队列里塞消息即可。
     """
@@ -159,13 +208,22 @@ def download_comic(book_url: str, out_root: str = "downloads",
     on_progress(f"[{site.name}] 《{comic.name}》共 {len(comic.chapters)} 章，"
                 f"本次下载 {len(todo)} 章")
 
+    failures: list[Failure] = []
     for c in todo:
         try:
-            ok, total = download_chapter(c, out_dir, session, workers, delay, site)
+            ok, total = download_chapter(c, out_dir, session, workers, delay,
+                                         site, failures)
             flag = "OK" if ok == total else "部分失败"
             on_progress(f"[{c.index}/{len(comic.chapters)}] {c.title} — {ok}/{total} {flag}")
         except ScrapeError as exc:
             on_progress(f"[{c.index}/{len(comic.chapters)}] {c.title} — 跳过: {exc}")
+
+    if failures:
+        if retry:
+            retry_failures(failures, session, workers, delay, on_progress)
+        else:
+            on_progress(f"本次有 {len(failures)} 张图没下来，"
+                        "加 --retry 可在下完后自动重试一轮")
 
     on_progress(f"完成，输出目录: {out_dir}")
     return out_dir
@@ -658,6 +716,8 @@ if __name__ == "__main__":
     p_dl.add_argument("-c", "--chapters", help="章节范围，如 1-10 或 1,3,5；省略为全部")
     p_dl.add_argument("-w", "--workers", type=int, default=4, help="每章并发下载数")
     p_dl.add_argument("-d", "--delay", type=float, default=0.15, help="每张图后的间隔秒数")
+    p_dl.add_argument("--retry", action="store_true",
+                      help="下完后把本次失败的图片重试一轮")
     p_dl.add_argument("--proxy", help="走指定代理（默认一律直连）")
 
     sub.add_parser("sites", help="列出支持的站点和 URL 形态")
@@ -703,7 +763,8 @@ if __name__ == "__main__":
         elif args.cmd == "download":
             out_dir = download_comic(args.url, args.out,
                                      parse_chapter_spec(args.chapters),
-                                     args.workers, args.delay, args.proxy)
+                                     args.workers, args.delay, args.proxy,
+                                     args.retry)
             print(f"\n请人工检查 {out_dir}，确认无误后运行：")
             print(f"  python scraper.py pack \"{out_dir}\"")
 

@@ -50,6 +50,7 @@ class Job:
         self.total = 0
         self.out_dir = ""
         self.zip_path = ""
+        self.failures: list[scraper.Failure] = []  # 本次没下来的图，可一键重试
         self._cancel.clear()
 
     def try_begin(self, kind: str) -> bool:
@@ -87,6 +88,7 @@ class Job:
                 "total": self.total,
                 "out_dir": self.out_dir,
                 "zip_path": self.zip_path,
+                "failed_count": len(self.failures),
                 "log": list(self.log),
             }
 
@@ -123,13 +125,14 @@ def _run_download(url: str, picked: set[int] | None,
         JOB.say(f"[{site.name}] 《{comic.name}》共 {len(comic.chapters)} 章，"
                 f"本次下载 {len(todo)} 章")
 
+        failures: list[scraper.Failure] = []
         for c in todo:
             if JOB.cancelled():
                 JOB.say("已被用户取消")
                 break
             try:
                 ok, total = scraper.download_chapter(
-                    c, out_dir, session, workers, delay, site)
+                    c, out_dir, session, workers, delay, site, failures)
                 flag = "OK" if ok == total else "部分失败"
                 JOB.say(f"[{c.index}] {c.title} — {ok}/{total} {flag}")
             except scraper.ScrapeError as exc:
@@ -139,6 +142,10 @@ def _run_download(url: str, picked: set[int] | None,
             with JOB._lock:
                 JOB.done += 1
 
+        with JOB._lock:
+            JOB.failures = failures
+        if failures:
+            JOB.say(f"本次有 {len(failures)} 张图没下来，可点『重试失败的图片』只补这几张")
         JOB.say("下载结束。请到文件夹人工检查，确认无误后再点『打包 ZIP』")
         with JOB._lock:
             JOB.state = "done"
@@ -158,6 +165,21 @@ def _run_pack(comic_dir: str, keep_source: bool, ext: str) -> None:
             JOB.state = "error" if stat["failed"] else "done"
     except Exception as exc:
         JOB.say(f"打包失败: {type(exc).__name__}: {exc}")
+        with JOB._lock:
+            JOB.state = "error"
+
+
+def _run_retry(site, pending: list, workers: int, delay: float) -> None:
+    try:
+        session = scraper.make_session(PROXY, site)
+        remaining: list[scraper.Failure] = []
+        scraper.retry_failures(pending, session, workers, delay,
+                               JOB.say, remaining)
+        with JOB._lock:
+            JOB.failures = remaining      # 还没下来的留着，可以再点一次
+            JOB.state = "error" if remaining else "done"
+    except Exception as exc:
+        JOB.say(f"重试失败: {type(exc).__name__}: {exc}")
         with JOB._lock:
             JOB.state = "error"
 
@@ -249,6 +271,30 @@ def api_download():
     delay = _opt_num(data, "delay", DEFAULT_DELAY, float, 0.0, 5.0)
     if not _start("download", _run_download, url, picked, workers, delay):
         return jsonify({"error": "已有任务在跑，请等它结束或先取消"}), 409
+    return jsonify({"ok": True})
+
+
+@app.post("/api/retry")
+def api_retry():
+    """只重下本次任务里失败的那几张图，不重解析章节、不碰已完成的数据。"""
+    data = request.get_json(silent=True) or {}
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "请填写漫画目录页 URL"}), 400
+    # 必须在抢槽之前取出来：_start() 会 reset()，那会清掉这份清单
+    with JOB._lock:
+        pending = list(JOB.failures)
+    if not pending:
+        return jsonify({"error": "本次没有失败的图片"}), 400
+    try:
+        site = scraper.pick_site(url)
+    except scraper.ScrapeError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    workers = _opt_num(data, "workers", DEFAULT_WORKERS, int, 1, 16)
+    delay = _opt_num(data, "delay", DEFAULT_DELAY, float, 0.0, 5.0)
+    if not _start("retry", _run_retry, site, pending, workers, delay):
+        return jsonify({"error": "已有任务在跑"}), 409
     return jsonify({"ok": True})
 
 

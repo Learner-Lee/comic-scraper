@@ -119,6 +119,7 @@
   <div class="row">
     <button class="primary" id="btnDownload">开始下载</button>
     <button id="btnCancel" disabled>取消</button>
+    <button id="btnRetry" disabled>重试失败的图片</button>
     <span id="dlState" class="hint"></span>
   </div>
   <div class="bar"><i id="barFill"></i></div>
@@ -216,6 +217,20 @@ $("btnCancel").onclick = async () => {
   $("dlState").textContent = "正在取消，当前章节下完后停止…";
 };
 
+$("btnRetry").onclick = async () => {
+  try {
+    await post("/api/retry", {
+      url: $("url").value,
+      workers: $("workers").value,
+      delay: $("delay").value,
+    });
+    $("dlState").textContent = "正在重试失败的图片…";
+    startPolling();
+  } catch (e) {
+    $("dlState").textContent = "失败：" + e.message;
+  }
+};
+
 $("btnCheck").onclick = async () => {
   if (!comicName) { $("checkMsg").textContent = "请先获取章节"; return; }
   try {
@@ -277,6 +292,11 @@ async function tick() {
   $("btnPack").disabled = running;
   $("btnRepair").disabled = running;
   $("btnCancel").disabled = !running || d.kind !== "download";
+
+  // 本次有图没下来才亮这个按钮，顺便把张数标在上面
+  const nf = d.failed_count || 0;
+  $("btnRetry").disabled = running || nf === 0;
+  $("btnRetry").textContent = nf ? `重试失败的 ${nf} 张` : "重试失败的图片";
 
   if (d.log.length) $("log").textContent = d.log.join("\n");
   $("log").scrollTop = $("log").scrollHeight;
