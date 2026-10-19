@@ -7,6 +7,7 @@
 | manwame.com | `https://manwame.com/book/<名字>-<id>` |
 | 8comic.com（無限動漫） | `https://www.8comic.com/html/<id>.html` |
 | m.manhuagui.com（看漫画 / 漫画柜） | `https://m.manhuagui.com/comic/<id>/` |
+| shenqimanhua.net（神奇漫画） | `https://shenqimanhua.net/comic/<id>` |
 
 随时可以查：
 
@@ -186,6 +187,25 @@ python app.py                   # http://127.0.0.1:60001
    `%25xx`，取回来是 404。
 6. 图床强制校验 Referer，不带直接 403。图片格式是 webp。
 
+### shenqimanhua.net
+
+Next.js App Router 站点。数据是**明文 JSON**，既不加密也不混淆——四个站里最简单的，
+难点只在「数据藏在哪」：章节和图片都在 RSC 流数据里，以转义 JSON 的形式嵌在 HTML。
+
+1. **章节列表有三个来源，只有一个是全的**（实测 142 章）：
+
+   | 来源 | 条数 | 能用吗 |
+   |---|---|---|
+   | 可见 HTML 的 `a[href^="/read/"]` | 20 | ✗ 只是首屏，「展开更多章节」是 JS 按钮 |
+   | JSON-LD 的 `hasPart` | 10 | ✗ 只有最近 10 话 |
+   | RSC 流里的转义 JSON | **142** | ✓ |
+
+2. **`number` 字段不唯一**，不能当章节序号——实测 106 / 114 / 123 各出现两次，
+   因为「休刊公告」和正式话共用了同一个 number（142 章 = 139 正式话 + 3 则公告）。
+   所以按 RSC 流里的出现顺序编号，那就是站点自己的阅读顺序，无需反转。
+3. 图片路径同样在 RSC 流里（`/image/.../img/N.webp`），序号从 1 连续递增。
+4. 图床**不校验 Referer**，图片格式是 webp。
+
 ### 8comic.com
 
 1. **章节目录**也是直出 HTML，取 `a.Ch` 的 `onclick`。注意页面里有两个 `ul.eps_list`，第一个是空壳，真正的章节在第二个。
@@ -213,6 +233,13 @@ AES 密钥是从站点前端 `cms.js` 提取的硬编码值。站点若更换密
 重新提取方法：打开任意章节页，在浏览器控制台执行 `CMS.chapter.decrypt(params)` 对照，或用 Node 加载 `cms.js` 后钩住 `CryptoJS.AES.decrypt` 打印密钥。
 
 站点若改版导致目录解析失败，程序会报 `目录页没找到 [data-chapter-list]`，届时更新选择器即可。
+
+### shenqimanhua
+
+数据是明文 JSON，没有加密也没有魔法值，所以逻辑很薄。风险在于正则依赖
+Next.js 的 RSC 流转义格式：站点若升级框架导致格式变化，`_CHAPTER_RE` 和
+`_IMAGE_RE` 是要改的地方。两者解析不到内容时都会明确报错并点明是哪条正则，
+不会静默返回空列表。
 
 ### manhuagui
 

@@ -620,9 +620,96 @@ class ManhuaguiSite(Site):
                 for path in images]
 
 
+# ------------------------------------------------------------------ 神奇漫画
+
+class ShenqiSite(Site):
+    """shenqimanhua.net（神奇漫画）。
+
+    Next.js App Router 站点。数据是**明文 JSON**，既不加密也不混淆——四个站里
+    最简单的一个，难点只在「数据藏在哪」：章节和图片都在 RSC 流数据里，
+    以转义 JSON 的形式嵌在 HTML 中。
+
+    章节列表有三个来源，只有一个是全的（实测 142 章）：
+      * 可见 HTML 的 a[href^="/read/"]  只有 20 个，是首屏，「展开更多章节」是 JS 按钮
+      * JSON-LD 的 hasPart              只有最近 10 话
+      * RSC 流里的转义 JSON              142 章，完整 ← 用这个
+
+    另一个坑：`number` 字段**不唯一**，实测 106/114/123 各出现两次——「休刊公告」
+    和正式话共用了同一个 number。所以按 RSC 流里的出现顺序编号，那就是站点自己的
+    阅读顺序（第 1 话在最前，无需反转）。
+    """
+
+    name = "shenqimanhua"
+    home = "https://shenqimanhua.net"
+    label = "神奇漫画"
+    url_hint = "https://shenqimanhua.net/comic/<id>"
+    example = "https://shenqimanhua.net/comic/cmiom81n01kktllnk1xkoc2i0"
+    notes = "Next.js 站点，章节与图片都在 RSC 流里（明文 JSON）；图床不校验 Referer"
+
+    # RSC 流里的章节对象是转义的：\"id\":\"...\",\"title\":\"第1话\",\"number\":1
+    _CHAPTER_RE = re.compile(
+        r'\\"id\\":\\"([A-Za-z0-9]+)\\",\\"title\\":\\"([^"\\]+)\\",\\"number\\":(\d+)')
+    _IMAGE_RE = re.compile(r'\\"url\\":\\"(/image/[^"\\]+)\\"')
+    _CID_RE = re.compile(r"/comic/([A-Za-z0-9]+)")
+
+    @staticmethod
+    def matches(url: str) -> bool:
+        return urlparse(url).netloc.lower().endswith("shenqimanhua.net")
+
+    def headers(self) -> dict:
+        # 实测图床不校验，带上只是更像真实浏览器
+        return {"Referer": self.home + "/"}
+
+    def fetch_chapters(self, book_url: str, session: requests.Session) -> Comic:
+        resp = session.get(book_url, timeout=20)
+        resp.raise_for_status()
+        html = html_text(resp)
+
+        soup = BeautifulSoup(html, "html.parser")
+        # html.parser 会把属性名转小写，所以选择器用 itemprop
+        el = soup.select_one('h1[itemprop="name"]') or soup.select_one("h1")
+        name = safe_name(el.get_text(strip=True) if el else "", "comic")
+
+        m = self._CID_RE.search(book_url)
+        if not m:
+            raise ScrapeError(f"认不出的目录页地址: {book_url}")
+        cid = m.group(1)
+
+        chapters: list[Chapter] = []
+        seen: set[str] = set()
+        for chap_id, title, _number in self._CHAPTER_RE.findall(html):
+            if chap_id in seen:
+                continue
+            seen.add(chap_id)
+            chapters.append(Chapter(
+                url=f"{self.home}/read/{cid}/{chap_id}",
+                title=safe_name(title, f"chapter_{len(chapters) + 1}"),
+                index=len(chapters) + 1))
+        if not chapters:
+            raise ScrapeError(
+                "目录页没解析出章节。章节数据在 Next.js 的 RSC 流里，"
+                "站点若升级框架导致格式变化就会这样，需要更新 _CHAPTER_RE")
+        return Comic(name=name, url=book_url, chapters=chapters)
+
+    def fetch_chapter_images(self, chapter_url: str,
+                             session: requests.Session) -> list[str]:
+        resp = session.get(chapter_url, timeout=20)
+        resp.raise_for_status()
+        html = html_text(resp)
+
+        # dict.fromkeys 去重且保序——顺序就是阅读顺序
+        paths = list(dict.fromkeys(self._IMAGE_RE.findall(html)))
+        if not paths:
+            raise ScrapeError(
+                f"章节页没解析出图片: {chapter_url}（站点可能已改版，"
+                "需要更新 _IMAGE_RE）")
+        return [urljoin(self.home, path) for path in paths]
+
+
 # ------------------------------------------------------------------ 路由
 
-_SITES: tuple[type[Site], ...] = (ManwameSite, EightComicSite, ManhuaguiSite)
+_SITES: tuple[type[Site], ...] = (ManwameSite, EightComicSite, ManhuaguiSite,
+                                  ShenqiSite)
 
 
 def all_sites() -> tuple[type[Site], ...]:
