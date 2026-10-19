@@ -129,7 +129,16 @@
   <legend>3 · 人工检查</legend>
   <div class="row">
     <button id="btnCheck">刷新已下载章节</button>
+    <button id="btnRepair">检查并补齐缺图</button>
+    <label class="inline">
+      <input type="checkbox" id="repairZip" checked> 含已打包的 zip
+    </label>
     <span id="checkMsg" class="hint"></span>
+  </div>
+  <div class="hint">
+    「刷新」只看本地张数；「补齐缺图」会联网取每章真实页数再比对，所以慢得多，
+    但能发现<b>末尾缺图</b>这种本地看不出来的情况（序号是连续的，就是少了最后一张）。
+    只补缺的那几张，不重下整章；已打包的 zip 会校验通过后原子替换。进度见上方日志。
   </div>
   <table id="checkTable"></table>
 </fieldset>
@@ -225,6 +234,21 @@ $("btnCheck").onclick = async () => {
   }
 };
 
+$("btnRepair").onclick = async () => {
+  try {
+    await post("/api/repair", {
+      url: $("url").value,
+      include_packed: $("repairZip").checked,
+      workers: $("workers").value,
+      delay: $("delay").value,
+    });
+    $("checkMsg").textContent = "核对中…进度见上方日志";
+    startPolling();
+  } catch (e) {
+    $("checkMsg").textContent = "失败：" + e.message;
+  }
+};
+
 $("btnPack").onclick = async () => {
   if (!comicName) { $("packMsg").textContent = "请先获取章节"; return; }
   try {
@@ -251,6 +275,7 @@ async function tick() {
   const running = d.state === "running";
   $("btnDownload").disabled = running;
   $("btnPack").disabled = running;
+  $("btnRepair").disabled = running;
   $("btnCancel").disabled = !running || d.kind !== "download";
 
   if (d.log.length) $("log").textContent = d.log.join("\n");
@@ -265,7 +290,8 @@ async function tick() {
   if (!running) {
     clearInterval(polling);
     polling = null;
-    if (d.kind === "download" && d.state === "done") $("btnCheck").click();
+    if (d.state === "done" && (d.kind === "download" || d.kind === "repair"))
+      $("btnCheck").click();
   }
 }
 

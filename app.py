@@ -162,6 +162,21 @@ def _run_pack(comic_dir: str, keep_source: bool, ext: str) -> None:
             JOB.state = "error"
 
 
+def _run_repair(url: str, include_packed: bool,
+                workers: int, delay: float) -> None:
+    try:
+        stat = scraper.repair_comic(url, out_root=DOWNLOAD_ROOT,
+                                    include_packed=include_packed,
+                                    workers=workers, delay=delay,
+                                    proxy=PROXY, on_progress=JOB.say)
+        with JOB._lock:
+            JOB.state = "error" if stat["failed"] else "done"
+    except Exception as exc:
+        JOB.say(f"补齐失败: {type(exc).__name__}: {exc}")
+        with JOB._lock:
+            JOB.state = "error"
+
+
 def _start(kind: str, target, *args) -> bool:
     """抢到任务槽才起线程。抢不到返回 False，由调用方回 409。"""
     if not JOB.try_begin(kind):
@@ -234,6 +249,30 @@ def api_download():
     delay = _opt_num(data, "delay", DEFAULT_DELAY, float, 0.0, 5.0)
     if not _start("download", _run_download, url, picked, workers, delay):
         return jsonify({"error": "已有任务在跑，请等它结束或先取消"}), 409
+    return jsonify({"ok": True})
+
+
+@app.post("/api/repair")
+def api_repair():
+    """联网核对每章真实页数，补齐缺失的图片。
+
+    目录由站点解析出的漫画名决定（不收前端传的路径），所以不存在越界问题。
+    """
+    data = request.get_json(silent=True) or {}
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "请填写漫画目录页 URL"}), 400
+    try:
+        scraper.pick_site(url)
+    except scraper.ScrapeError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    workers = _opt_num(data, "workers", DEFAULT_WORKERS, int, 1, 16)
+    delay = _opt_num(data, "delay", DEFAULT_DELAY, float, 0.0, 5.0)
+    include_packed = data.get("include_packed", True)
+    if not _start("repair", _run_repair, url, bool(include_packed),
+                  workers, delay):
+        return jsonify({"error": "已有任务在跑"}), 409
     return jsonify({"ok": True})
 
 
