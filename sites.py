@@ -181,6 +181,61 @@ class ManwameSite(Site):
                 for item in params.get("chapter_images") or []]
 
 
+# ------------------------------------------------------------------ 开心漫
+
+class KaixinmanSite(ManwameSite):
+    """www.kaixinman.com（开心漫）。
+
+    和 manwame 是**同一套 CMS**：`params` 的加密方式、AES 密钥、解出来的 JSON
+    字段结构全都一样（实测用 manwame 的密钥直接解开了）。所以这里继承
+    ManwameSite，解密和图片拼接一行都不用重写，只换域名和目录页的选择器。
+
+    `headers()` 也继承——它用的是 `self.home`，子类自然带上自己的 Referer。
+    """
+
+    name = "kaixinman"
+    home = "https://www.kaixinman.com"
+    label = "开心漫"
+    url_hint = "https://www.kaixinman.com/comic/<id>"
+    example = "https://www.kaixinman.com/comic/35ymklm1nL"
+    notes = "与 manwame 同一套 CMS（params + 同一个 AES 密钥）；图床不校验 Referer"
+
+    @staticmethod
+    def matches(url: str) -> bool:
+        return urlparse(url).netloc.lower().endswith("kaixinman.com")
+
+    def fetch_chapters(self, book_url: str, session: requests.Session) -> Comic:
+        resp = session.get(book_url, timeout=20)
+        resp.raise_for_status()
+        soup = BeautifulSoup(html_text(resp), "html.parser")
+
+        # h1 里混着评分：<h1><span>名字</span><span class="score">9.9</span></h1>
+        # 直接 get_text() 会得到「名字9.9」，所以取第一个 span
+        name = ""
+        h1 = soup.select_one("h1")
+        if h1:
+            span = h1.find("span")
+            name = (span or h1).get_text(strip=True)
+        if not name and soup.title:
+            name = soup.title.get_text(strip=True).split(" - ")[0]
+        name = safe_name(name, "comic")
+
+        box = soup.select_one("ul.chapter-list")
+        if box is None:
+            raise ScrapeError("目录页没找到 ul.chapter-list，站点结构可能已改版")
+
+        # 这个站是正序排的（第1话在前），不用反转
+        chapters = [
+            Chapter(url=urljoin(self.home, a["href"]),
+                    title=safe_name(a.get_text(strip=True), f"chapter_{i}"),
+                    index=i)
+            for i, a in enumerate(box.select("a[href]"), start=1)
+        ]
+        if not chapters:
+            raise ScrapeError("目录里一章都没解析到")
+        return Comic(name=name, url=book_url, chapters=chapters)
+
+
 # ------------------------------------------------------------------ 8comic
 
 class EightComicSite(Site):
@@ -708,8 +763,8 @@ class ShenqiSite(Site):
 
 # ------------------------------------------------------------------ 路由
 
-_SITES: tuple[type[Site], ...] = (ManwameSite, EightComicSite, ManhuaguiSite,
-                                  ShenqiSite)
+_SITES: tuple[type[Site], ...] = (ManwameSite, KaixinmanSite, EightComicSite,
+                                  ManhuaguiSite, ShenqiSite)
 
 
 def all_sites() -> tuple[type[Site], ...]:

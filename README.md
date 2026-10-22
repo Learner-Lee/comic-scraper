@@ -5,6 +5,7 @@
 | 站点 | 目录页 URL 形态 |
 |---|---|
 | manwame.com | `https://manwame.com/book/<名字>-<id>` |
+| www.kaixinman.com（开心漫） | `https://www.kaixinman.com/comic/<id>` |
 | 8comic.com（無限動漫） | `https://www.8comic.com/html/<id>.html` |
 | m.manhuagui.com（看漫画 / 漫画柜） | `https://m.manhuagui.com/comic/<id>/` |
 | shenqimanhua.net（神奇漫画） | `https://shenqimanhua.net/comic/<id>` |
@@ -27,6 +28,36 @@ downloads/漫画名/002 第2话/0001.webp   →   downloads/漫画名/002 第2�
 ```
 
 每章 zip 校验通过（条目数比对 + 逐条 CRC）后才删除对应源目录，空间正是这样省下来的。
+
+## 双击启动
+
+不想敲命令的话，直接双击 **`启动.command`**。macOS 会在 Terminal 里打开它，
+所以输出看得见、Ctrl+C 停得下：
+
+```
+════════════════════════════════════════
+   漫画爬虫
+════════════════════════════════════════
+   1) 启动网页界面
+   2) 预检一部漫画（下载前先确认能下）
+   3) 下载一部漫画
+   4) 核对已下载的章节
+   5) 打包成 ZIP
+   6) 支持哪些站点
+   q) 退出
+```
+
+- 选 1 会自动打开浏览器；每项做完回到菜单，不用反复双击
+- 下载时会记住上次的 URL，回车就能沿用
+- 核对和打包会把 `downloads/` 下的漫画列出来按编号选，不用敲路径
+- 打包前会二次确认（它会删源目录）
+
+**首次双击若提示「无法打开，因为来自身份不明的开发者」**：右键点它 →「打开」，
+确认一次之后就能正常双击了。
+
+脚本刻意不用 `source venv/bin/activate`，而是直接调 `./venv/bin/python`——
+这个 venv 曾经是从别的机器复制来的，activate 里硬编码着旧路径，激活后反而会
+报 `No module named 'Crypto'`。
 
 ## 安装
 
@@ -153,6 +184,7 @@ python app.py                   # http://127.0.0.1:60001
 | `scraper.py` | 通用流程（下载、断点续传、打包、校验）+ 命令行入口 |
 | `sites.py` | 站点适配器：各站怎么拿章节列表、怎么拿图片直链 |
 | `lzstring.py` | LZString 解压，manhuagui 的字典要用 |
+| `启动.command` | 双击运行的菜单脚本（macOS） |
 | `app.py` | Flask Web 界面 |
 | `templates/app.html` | 前端单页 |
 
@@ -169,6 +201,22 @@ python app.py                   # http://127.0.0.1:60001
 1. **章节目录**是服务端直出的 HTML，用 `[data-chapter-list] a` 选择器即可解析，不需要浏览器内核。
 2. **章节图片**不在 HTML 里，而是 AES-128-CBC 加密后放在页面的 `params` 变量中。IV 是 base64 解码后的前 16 字节，密文是其余部分，解密得到含 `chapter_images`（图片 token）和 `images_hosts`（CDN 域名）的 JSON。
 3. **图片 CDN 强制校验 Referer**，不带会返回 403（页面 HTML 里的 `referrerpolicy="no-referrer"` 是误导）。
+
+### www.kaixinman.com
+
+和 manwame 是**同一套 CMS**：`params` 的加密方式、AES 密钥、解出来的 JSON 字段
+结构完全一致（实测用 manwame 的密钥直接解开了）。所以 `KaixinmanSite` 直接继承
+`ManwameSite`，解密和图片拼接一行都没重写，只换了域名和这两处选择器：
+
+| 项 | manwame | kaixinman |
+|---|---|---|
+| 章节列表 | `[data-chapter-list]` | `ul.chapter-list` |
+| 漫画名 | `.profile-text h1` | `h1 > span`（第一个） |
+
+漫画名那里有个小坑：`<h1><span>名字</span><span class="score">9.9</span></h1>`，
+直接 `get_text()` 会得到「名字9.9」，所以取第一个 `span`。
+
+章节是正序的（第1话在前），图床 `s2.bzcdn.net` 不校验 Referer。
 
 ### m.manhuagui.com
 
